@@ -35,6 +35,7 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
+from .update_weight.update_weight_from_delta import UpdateWeightFromDelta
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
@@ -124,7 +125,16 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        # Choose weight updater based on mode
+        if self.args.colocate:
+            if getattr(self.args, "use_delta_weight_sync", False):
+                update_weight_cls = UpdateWeightFromDelta
+                logger.info("Using delta weight sync for colocated mode")
+            else:
+                update_weight_cls = UpdateWeightFromTensor
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
+
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,

@@ -103,6 +103,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This will always be true when --colocate is set."
                 ),
             )
+            parser.add_argument(
+                "--use-delta-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to use delta weight sync for colocated mode. "
+                    "This only syncs changed elements instead of full weights, "
+                    "which is more efficient when only a small fraction of weights change per step."
+                ),
+            )
+            parser.add_argument(
+                "--delta-verify",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable correctness verification for delta weight sync. "
+                    "After each sync, samples key parameters and compares hashes between "
+                    "Slime (Megatron) and SGLang to detect silent corruption."
+                ),
+            )
 
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)

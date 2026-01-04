@@ -251,6 +251,52 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def update_weights_from_delta(
+        self,
+        serialized_delta_chunks: list[str],
+        flush_cache: bool = False,
+        weight_version: str | None = None,
+    ):
+        """
+        Update model weights from sparse delta updates.
+
+        This is more efficient than full weight replacement when only a small
+        fraction of elements have changed (e.g., in RL training scenarios).
+
+        Args:
+            serialized_delta_chunks: List of serialized (param_name, indices, values) tuples per tp_rank
+            flush_cache: Whether to flush cache after updating
+            weight_version: Optional weight version string
+        """
+        payload = {
+            "serialized_delta_chunks": serialized_delta_chunks,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_delta",
+            payload,
+        )
+
+    def get_param_sample_hashes(self, param_names: list[str]):
+        """
+        Get sampling hashes for specified parameters (for delta sync verification).
+
+        Args:
+            param_names: List of HF parameter names to verify
+
+        Returns:
+            Response containing hashes for each TP rank
+        """
+        payload = {
+            "param_names": param_names,
+        }
+        return self._make_request(
+            "get_param_sample_hashes",
+            payload,
+        )
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:

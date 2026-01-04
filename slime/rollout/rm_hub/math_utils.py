@@ -471,8 +471,30 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
 
 
 def extract_answer(passage: str) -> str:
+    """Extract the answer from a passage, supporting multiple formats:
+    1. LaTeX \\boxed{} command
+    2. "The answer is: X" format
+    """
+    # First try \boxed{} format
     if "\\boxed" in passage:
         return extract_boxed_answer(passage)
+
+    # Try "The answer is: X" format (case-insensitive)
+    # Common patterns: "The answer is: 42", "The answer is 42", "the answer is: 42"
+    patterns = [
+        r"[Tt]he\s+answer\s+is:?\s*([^\n,\.]+)",  # The answer is: X or The answer is X
+        r"[Aa]nswer:?\s*([^\n,\.]+)",  # Answer: X
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, passage)
+        if match:
+            answer = match.group(1).strip()
+            # Clean up common suffixes
+            answer = re.sub(r'\s*(\\text\{[^}]*\}|dollars?|cents?|miles?|hours?|minutes?|seconds?|years?|days?|feet|foot|inches?|meters?|cm|mm|kg|g|lbs?|units?)\s*$', '', answer, flags=re.IGNORECASE)
+            if answer:
+                return answer
+
     return None
 
 
@@ -480,8 +502,13 @@ def grade_answer_verl(solution_str, ground_truth):
     if not ground_truth:
         return False
     ground_truth = str(ground_truth)
-    if "\\boxed" in ground_truth:
-        ground_truth = extract_answer(ground_truth)
+
+    # Extract answer from ground_truth if it's in a structured format
+    if "\\boxed" in ground_truth or "answer is" in ground_truth.lower():
+        extracted_gt = extract_answer(ground_truth)
+        if extracted_gt is not None:
+            ground_truth = extracted_gt
+
     given_answer = extract_answer(solution_str)
     if given_answer is None:
         return False
