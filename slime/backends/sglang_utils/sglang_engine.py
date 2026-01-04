@@ -256,6 +256,7 @@ class SGLangEngine(RayActor):
         serialized_delta_chunks: list[str],
         flush_cache: bool = False,
         weight_version: str | None = None,
+        protocol_version: str | None = None,
     ):
         """
         Update model weights from sparse delta updates.
@@ -267,6 +268,7 @@ class SGLangEngine(RayActor):
             serialized_delta_chunks: List of serialized (param_name, indices, values) tuples per tp_rank
             flush_cache: Whether to flush cache after updating
             weight_version: Optional weight version string
+            protocol_version: Protocol version for compatibility check
         """
         payload = {
             "serialized_delta_chunks": serialized_delta_chunks,
@@ -274,6 +276,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if protocol_version is not None:
+            payload["protocol_version"] = protocol_version
         return self._make_request(
             "update_weights_from_delta",
             payload,

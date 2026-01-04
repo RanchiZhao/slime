@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # Threshold for falling back to dense transfer (changed_ratio > threshold)
 DENSE_THRESHOLD = 0.3  # 30%
 
+# Protocol version for Slime↔SGLang delta sync compatibility
+# Increment this when making breaking changes to the delta sync protocol
+DELTA_SYNC_PROTOCOL_VERSION = "1.0"
+
 
 def is_moe_expert_param(param_name: str) -> bool:
     """Check if parameter is an MoE expert parameter.
@@ -256,6 +260,174 @@ def split_indices_by_tp_row(
     return tensor_results
 
 
+# ============================================================================
+# Fused Parameter Handling (Non-MoE)
+# ============================================================================
+
+# Parameters that should be fused for SGLang compatibility
+FUSABLE_QKV_PARAMS = {"q_proj", "k_proj", "v_proj"}
+FUSABLE_GATE_UP_PARAMS = {"gate_proj", "up_proj"}
+
+
+def is_fusable_qkv_param(param_name: str) -> bool:
+    """Check if parameter is part of a fusable QKV group (non-MoE only)."""
+    if is_moe_expert_param(param_name):
+        return False
+    parts = param_name.replace(".weight", "").replace(".bias", "").split(".")
+    layer_name = parts[-1] if parts else ""
+    return layer_name in FUSABLE_QKV_PARAMS
+
+
+def is_fusable_gate_up_param(param_name: str) -> bool:
+    """Check if parameter is part of a fusable gate_up group (non-MoE only)."""
+    if is_moe_expert_param(param_name):
+        return False
+    parts = param_name.replace(".weight", "").replace(".bias", "").split(".")
+    layer_name = parts[-1] if parts else ""
+    return layer_name in FUSABLE_GATE_UP_PARAMS
+
+
+def extract_layer_id(param_name: str) -> int | None:
+    """Extract layer ID from parameter name.
+
+    Example: 'model.layers.5.self_attn.q_proj.weight' -> 5
+    """
+    import re
+    match = re.search(r"layers\.(\d+)\.", param_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def fuse_qkv_sparse_deltas(
+    q_data: tuple[torch.Tensor, torch.Tensor, tuple] | None,
+    k_data: tuple[torch.Tensor, torch.Tensor, tuple] | None,
+    v_data: tuple[torch.Tensor, torch.Tensor, tuple] | None,
+    tp_size: int,
+) -> tuple[str, dict[int, tuple[torch.Tensor, torch.Tensor]], tuple] | None:
+    """Fuse q/k/v sparse deltas into qkv_proj format.
+
+    IMPORTANT: All three components (q, k, v) must be present for correct fusion.
+    If any component is missing, returns None and the caller should handle fallback.
+
+    Args:
+        q_data: (indices, values, shape) for q_proj or None
+        k_data: (indices, values, shape) for k_proj or None
+        v_data: (indices, values, shape) for v_proj or None
+        tp_size: Number of TP ranks
+
+    Returns:
+        ("qkv_proj.weight", per_tp_data, fused_shape) or None if incomplete
+    """
+    # CRITICAL: All three must be present for correct fused layout
+    # SGLang's qkv_proj expects [q_dim + k_dim + v_dim, hidden]
+    # If any component is missing, we cannot compute correct offsets
+    if q_data is None or k_data is None or v_data is None:
+        if q_data is not None or k_data is not None or v_data is not None:
+            logger.debug(
+                f"Incomplete qkv set for fusion: q={q_data is not None}, "
+                f"k={k_data is not None}, v={v_data is not None}. Skipping fusion."
+            )
+        return None
+
+    # All should have same hidden_size (in_dim)
+    # Shape is [out_dim, in_dim] where out_dim varies (q_dim, k_dim, v_dim)
+    in_dim = q_data[2][1]  # hidden_size
+
+    # For Qwen3, q/k/v have same out_dim (num_heads * head_dim)
+    # For models with MQA/GQA, k/v might have smaller out_dim
+    q_out = q_data[2][0]
+    k_out = k_data[2][0]
+    v_out = v_data[2][0]
+
+    # Fused shape: [(q_out + k_out + v_out), in_dim]
+    fused_out = q_out + k_out + v_out
+    fused_shape = (fused_out, in_dim)
+
+    # Compute offsets in fused tensor (flattened)
+    q_offset = 0
+    k_offset = q_out * in_dim
+    v_offset = (q_out + k_out) * in_dim
+
+    # All three (q, k, v) are guaranteed present at this point
+    q_indices, q_values, _ = q_data
+    k_indices, k_values, _ = k_data
+    v_indices, v_values, _ = v_data
+
+    # Combine indices with offsets
+    fused_indices = torch.cat([
+        q_indices + q_offset,
+        k_indices + k_offset,
+        v_indices + v_offset,
+    ])
+    fused_values = torch.cat([q_values, k_values, v_values])
+
+    # Now split by TP (qkv_proj is ColumnParallel)
+    per_tp_data = split_indices_by_tp_column(
+        fused_indices, fused_values, fused_out, in_dim, tp_size
+    )
+
+    return ("qkv_proj.weight", per_tp_data, fused_shape)
+
+
+def fuse_gate_up_sparse_deltas(
+    gate_data: tuple[torch.Tensor, torch.Tensor, tuple] | None,
+    up_data: tuple[torch.Tensor, torch.Tensor, tuple] | None,
+    tp_size: int,
+) -> tuple[str, dict[int, tuple[torch.Tensor, torch.Tensor]], tuple] | None:
+    """Fuse gate/up sparse deltas into gate_up_proj format.
+
+    IMPORTANT: Both components (gate, up) must be present for correct fusion.
+    If any component is missing, returns None and the caller should handle fallback.
+
+    Args:
+        gate_data: (indices, values, shape) for gate_proj or None
+        up_data: (indices, values, shape) for up_proj or None
+        tp_size: Number of TP ranks
+
+    Returns:
+        ("gate_up_proj.weight", per_tp_data, fused_shape) or None if incomplete
+    """
+    # CRITICAL: Both must be present for correct fused layout
+    # SGLang's gate_up_proj expects [gate_dim + up_dim, hidden]
+    # If either component is missing, we cannot compute correct offsets
+    if gate_data is None or up_data is None:
+        if gate_data is not None or up_data is not None:
+            logger.debug(
+                f"Incomplete gate_up set for fusion: gate={gate_data is not None}, "
+                f"up={up_data is not None}. Skipping fusion."
+            )
+        return None
+
+    in_dim = gate_data[2][1]  # hidden_size
+
+    gate_out = gate_data[2][0]
+    up_out = up_data[2][0]
+
+    # Fused shape: [(gate_out + up_out), in_dim]
+    fused_out = gate_out + up_out
+    fused_shape = (fused_out, in_dim)
+
+    # Compute offsets in fused tensor (flattened)
+    gate_offset = 0
+    up_offset = gate_out * in_dim
+
+    # Both gate and up are guaranteed present at this point
+    gate_indices, gate_values, _ = gate_data
+    up_indices, up_values, _ = up_data
+
+    # Combine indices with offsets
+    fused_indices = torch.cat([gate_indices + gate_offset, up_indices + up_offset])
+    fused_values = torch.cat([gate_values, up_values])
+
+    # gate_up_proj is ColumnParallel
+    per_tp_data = split_indices_by_tp_column(
+        fused_indices, fused_values, fused_out, in_dim, tp_size
+    )
+
+    return ("gate_up_proj.weight", per_tp_data, fused_shape)
+
+
 class UpdateWeightFromDelta:
     """
     Update rollout engines using sparse delta updates.
@@ -426,15 +598,19 @@ class UpdateWeightFromDelta:
         all_tensors_to_store = []
         chunk_idx = 0
 
-        total_sparse_params = 0
-        total_dense_params = 0
-        total_skipped_params = 0
-        total_sparse_elements = 0
-        total_dense_elements = 0
-        total_moe_expert_params = 0
+        # Statistics counters (clear naming for log output)
+        total_non_moe_sparse_params = 0    # Non-MoE params updated via sparse path
+        total_non_moe_dense_params = 0     # Non-MoE params updated via dense/baseline path
+        total_skipped_params = 0           # Params with no changes
+        total_non_moe_sparse_elements = 0  # Total elements in non-MoE sparse updates
+        total_non_moe_dense_elements = 0   # Total elements in non-MoE dense updates
+        total_moe_sparse_params = 0        # MoE expert params updated via sparse path
+        total_moe_dense_params = 0         # MoE expert params updated via dense path (threshold fallback)
 
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             chunk_start = time.time()
+            diff_time = 0.0  # Time spent on diff/indices computation
+            send_time = 0.0  # Time spent on serialize+gather+sglang_apply
 
             # Phase 1: Classify params and compute deltas (read-only operations)
             sparse_params = []  # [(name, per_tp_data, shape, partition_dim)]
@@ -442,6 +618,11 @@ class UpdateWeightFromDelta:
             moe_expert_dense_params = []  # [(name, tensor, moe_info)] - MoE dense/full update
             moe_expert_sparse_params = []  # [(name, per_tp_data, shape, moe_info)] - MoE sparse update
             tensors_for_storage = []  # [(name, tensor)] - collect for post-send storage
+
+            # Buffers for fusable params (keyed by layer_id)
+            # Each stores (indices, values, shape) for the raw delta BEFORE TP split
+            qkv_buffer: dict[int, dict[str, tuple]] = {}  # layer_id -> {"q": ..., "k": ..., "v": ...}
+            gate_up_buffer: dict[int, dict[str, tuple]] = {}  # layer_id -> {"gate": ..., "up": ...}
 
             for name, tensor in hf_named_tensors:
                 tensors_for_storage.append((name, tensor))
@@ -503,7 +684,7 @@ class UpdateWeightFromDelta:
                                             )
 
                                         moe_expert_sparse_params.append((name, per_tp_data, shape, moe_info_dict))
-                                        total_moe_expert_params += 1
+                                        total_moe_sparse_params += 1
                                         del old_gpu
                                         continue
 
@@ -511,19 +692,19 @@ class UpdateWeightFromDelta:
 
                             # Fallback to dense MoE update (first sync or high change ratio)
                             moe_expert_dense_params.append((name, tensor, moe_info_dict))
-                            total_moe_expert_params += 1
+                            total_moe_dense_params += 1
                             continue
                     # Fallback to dense for parse failure
                     dense_params.append((name, tensor))
-                    total_dense_params += 1
-                    total_dense_elements += tensor.numel()
+                    total_non_moe_dense_params += 1
+                    total_non_moe_dense_elements += tensor.numel()
                     continue
 
                 # New param (not in storage) - use dense
                 if name not in self._last_synced_weights:
                     dense_params.append((name, tensor))
-                    total_dense_params += 1
-                    total_dense_elements += tensor.numel()
+                    total_non_moe_dense_params += 1
+                    total_non_moe_dense_elements += tensor.numel()
                     continue
 
                 # Compare with stored weights
@@ -532,8 +713,8 @@ class UpdateWeightFromDelta:
                 if old_cpu.shape != tensor.shape:
                     # Shape changed - use dense
                     dense_params.append((name, tensor))
-                    total_dense_params += 1
-                    total_dense_elements += tensor.numel()
+                    total_non_moe_dense_params += 1
+                    total_non_moe_dense_elements += tensor.numel()
                     continue
 
                 # GPU comparison (read-only, doesn't modify original tensor)
@@ -551,8 +732,8 @@ class UpdateWeightFromDelta:
                 if changed_ratio > DENSE_THRESHOLD:
                     # Too many changes - use dense
                     dense_params.append((name, tensor))
-                    total_dense_params += 1
-                    total_dense_elements += tensor.numel()
+                    total_non_moe_dense_params += 1
+                    total_non_moe_dense_elements += tensor.numel()
                     del old_gpu
                     continue
 
@@ -560,9 +741,38 @@ class UpdateWeightFromDelta:
                 changed_indices = torch.nonzero(changed_mask.view(-1), as_tuple=True)[0]
                 changed_values = tensor.view(-1)[changed_indices].clone()  # Clone to decouple from original
 
-                # Split by TP
-                partition_dim = get_partition_dim(name)
                 shape = tensor.shape
+                layer_id = extract_layer_id(name)
+
+                # Check if this is a fusable param (qkv or gate_up)
+                if is_fusable_qkv_param(name) and layer_id is not None:
+                    # Store raw delta for later fusion (don't split by TP yet)
+                    if layer_id not in qkv_buffer:
+                        qkv_buffer[layer_id] = {}
+                    parts = name.replace(".weight", "").split(".")
+                    component = parts[-1]  # q_proj, k_proj, or v_proj
+                    key = component.replace("_proj", "")  # q, k, or v
+                    qkv_buffer[layer_id][key] = (changed_indices, changed_values, shape)
+                    total_non_moe_sparse_params += 1
+                    total_non_moe_sparse_elements += num_changed
+                    del old_gpu
+                    continue
+
+                if is_fusable_gate_up_param(name) and layer_id is not None:
+                    # Store raw delta for later fusion
+                    if layer_id not in gate_up_buffer:
+                        gate_up_buffer[layer_id] = {}
+                    parts = name.replace(".weight", "").split(".")
+                    component = parts[-1]  # gate_proj or up_proj
+                    key = component.replace("_proj", "")  # gate or up
+                    gate_up_buffer[layer_id][key] = (changed_indices, changed_values, shape)
+                    total_non_moe_sparse_params += 1
+                    total_non_moe_sparse_elements += num_changed
+                    del old_gpu
+                    continue
+
+                # Non-fusable param: Split by TP immediately
+                partition_dim = get_partition_dim(name)
 
                 if len(shape) == 2 and partition_dim is not None:
                     out_dim, in_dim = shape
@@ -582,12 +792,38 @@ class UpdateWeightFromDelta:
                     }
 
                 sparse_params.append((name, per_tp_data, shape, partition_dim))
-                total_sparse_params += 1
-                total_sparse_elements += num_changed
+                total_non_moe_sparse_params += 1
+                total_non_moe_sparse_elements += num_changed
 
                 del old_gpu
 
+            # Record diff time (Phase 1 complete)
+            diff_time = time.time() - chunk_start
+
+            # Phase 1b: Fuse buffered qkv and gate_up params
+            for layer_id, components in qkv_buffer.items():
+                q_data = components.get("q")
+                k_data = components.get("k")
+                v_data = components.get("v")
+                fused = fuse_qkv_sparse_deltas(q_data, k_data, v_data, self._tp_size)
+                if fused:
+                    fused_name, per_tp_data, fused_shape = fused
+                    # Construct full param name: model.layers.{layer_id}.self_attn.qkv_proj.weight
+                    full_name = f"model.layers.{layer_id}.self_attn.{fused_name}"
+                    sparse_params.append((full_name, per_tp_data, fused_shape, 0))  # ColumnParallel
+
+            for layer_id, components in gate_up_buffer.items():
+                gate_data = components.get("gate")
+                up_data = components.get("up")
+                fused = fuse_gate_up_sparse_deltas(gate_data, up_data, self._tp_size)
+                if fused:
+                    fused_name, per_tp_data, fused_shape = fused
+                    # Construct full param name: model.layers.{layer_id}.mlp.gate_up_proj.weight
+                    full_name = f"model.layers.{layer_id}.mlp.{fused_name}"
+                    sparse_params.append((full_name, per_tp_data, fused_shape, 0))  # ColumnParallel
+
             # Phase 2a: Send sparse params (custom format, per-TP)
+            send_start = time.time()
             if sparse_params:
                 self._send_sparse_params(sparse_params)
 
@@ -611,17 +847,18 @@ class UpdateWeightFromDelta:
                 )
                 ray.get(refs)
                 del long_lived
+            send_time = time.time() - send_start
 
             # Collect for storage
             all_tensors_to_store.extend(tensors_for_storage)
 
             chunk_time = time.time() - chunk_start
+            fuse_time = chunk_time - diff_time - send_time  # Time for fusion operations
             if rank == 0 and chunk_idx % 20 == 0:
                 logger.info(
                     f"[Rank {rank}] Chunk {chunk_idx}: "
-                    f"sparse={len(sparse_params)}, dense={len(dense_params)}, "
-                    f"moe_sparse={len(moe_expert_sparse_params)}, moe_dense={len(moe_expert_dense_params)}, "
-                    f"time={chunk_time:.2f}s"
+                    f"non_moe_sparse={len(sparse_params)}, moe_sparse={len(moe_expert_sparse_params)}, "
+                    f"time={chunk_time:.2f}s (diff={diff_time:.2f}s, fuse={fuse_time:.2f}s, send={send_time:.2f}s)"
                 )
             chunk_idx += 1
 
@@ -631,9 +868,9 @@ class UpdateWeightFromDelta:
 
         logger.info(
             f"[Rank {rank}] Delta sync done: "
-            f"sparse={total_sparse_params} ({total_sparse_elements} elements), "
-            f"dense={total_dense_params} ({total_dense_elements} elements), "
-            f"moe_expert={total_moe_expert_params}, "
+            f"non_moe_sparse={total_non_moe_sparse_params} ({total_non_moe_sparse_elements} elements), "
+            f"non_moe_dense={total_non_moe_dense_params} ({total_non_moe_dense_elements} elements), "
+            f"moe_sparse={total_moe_sparse_params}, moe_dense={total_moe_dense_params}, "
             f"skipped={total_skipped_params}"
         )
 
@@ -702,6 +939,7 @@ class UpdateWeightFromDelta:
                     serialized_delta_chunks=serialized_delta_list,
                     flush_cache=False,
                     weight_version=str(self.weight_version),
+                    protocol_version=DELTA_SYNC_PROTOCOL_VERSION,
                 )
             ]
             ray.get(refs)
@@ -755,6 +993,7 @@ class UpdateWeightFromDelta:
                     serialized_delta_chunks=serialized_moe_list,
                     flush_cache=False,
                     weight_version=str(self.weight_version),
+                    protocol_version=DELTA_SYNC_PROTOCOL_VERSION,
                 )
             ]
             ray.get(refs)
@@ -817,6 +1056,7 @@ class UpdateWeightFromDelta:
                     serialized_delta_chunks=serialized_moe_list,
                     flush_cache=False,
                     weight_version=str(self.weight_version),
+                    protocol_version=DELTA_SYNC_PROTOCOL_VERSION,
                 )
             ]
             ray.get(refs)
