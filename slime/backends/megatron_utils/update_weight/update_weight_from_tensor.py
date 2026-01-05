@@ -187,9 +187,6 @@ def _send_to_colocated_engine(
     # TODO improve
     long_live_tensors = []
 
-    # DEBUG: 无条件打印，测试日志是否可见
-    print(f"[DEBUG] _send_to_colocated_engine called, rank={dist.get_rank()}, n_tensors={len(hf_named_tensors)}", flush=True)
-
     # --- PROFILING: Start ---
     if _is_baseline_profile_enabled():
         t_start = time.time()
@@ -254,16 +251,16 @@ def _send_to_colocated_engine(
         ray_time = time.time() - t_ray_start
         total_time = time.time() - t_start
         rank = dist.get_rank()
-        if rank == ipc_gather_src:
-            world_size = dist.get_world_size(ipc_gather_group)
-            total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
-            gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
-            print(
-                f"[Baseline Profile] rank={rank} n_tensors={len(hf_named_tensors)} "
-                f"data_mb={total_gathered_mb:.1f} "
-                f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
-                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s",
-                flush=True
-            )
+        # 所有 rank 都打印，因为 Ray 日志可能只收集部分 rank
+        world_size = dist.get_world_size(ipc_gather_group)
+        total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
+        gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
+        print(
+            f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} n_tensors={len(hf_named_tensors)} "
+            f"data_mb={total_gathered_mb:.1f} "
+            f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
+            f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s",
+            flush=True
+        )
 
     return refs, long_live_tensors
