@@ -156,13 +156,12 @@ def _get_megatron_full_params(
         # 计算这个 chunk 的数据量
         total_bytes = sum(p.numel() * p.element_size() for p in gathered_params)
         total_mb = total_bytes / (1024 * 1024)
-        # 从每个 IPC gather 组的 src rank 打印 (rank 0 和 rank 64)
-        if rank % 64 == 0:
-            print(
-                f"[NCCL Profile] rank={rank} n_params={len(megatron_local_param_infos)} data_mb={total_mb:.1f} "
-                f"init={init_time:.4f}s pp={pp_time:.4f}s ep={ep_time:.4f}s tp={tp_time:.4f}s total={total_time:.4f}s",
-                flush=True
-            )
+        # 从所有 rank 打印（Ray 会聚合重复的日志）
+        print(
+            f"[NCCL Profile] rank={rank} n_params={len(megatron_local_param_infos)} data_mb={total_mb:.1f} "
+            f"init={init_time:.4f}s pp={pp_time:.4f}s ep={ep_time:.4f}s tp={tp_time:.4f}s total={total_time:.4f}s",
+            flush=True
+        )
 
     return gathered_params
 
