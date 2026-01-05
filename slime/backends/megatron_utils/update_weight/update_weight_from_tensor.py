@@ -123,19 +123,44 @@ class UpdateWeightFromTensor:
         self.weight_version += 1
 
         rank = dist.get_rank()
+
+        if _is_baseline_profile_enabled():
+            t_flush_start = time.time()
+
         if rank == 0:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
-            t_chunks_start = time.time()
+            flush_time = time.time() - t_flush_start
+            t_weights_getter_start = time.time()
 
         megatron_local_weights = self.weights_getter()
 
+        if _is_baseline_profile_enabled():
+            weights_getter_time = time.time() - t_weights_getter_start
+            t_chunks_start = time.time()
+            total_rayget_time = 0.0
+            total_send_time = 0.0
+
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            if _is_baseline_profile_enabled():
+                t_send_start = time.time()
+
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+
+            if _is_baseline_profile_enabled():
+                send_time = time.time() - t_send_start
+                total_send_time += send_time
+                t_rayget_start = time.time()
+
             ray.get(refs)
+
+            if _is_baseline_profile_enabled():
+                rayget_time = time.time() - t_rayget_start
+                total_rayget_time += rayget_time
+
             del long_lived_tensors
             chunk_count += 1
 
@@ -144,7 +169,9 @@ class UpdateWeightFromTensor:
             total_time = time.time() - t_cycle_start
             print(
                 f"[Baseline Profile] Cycle complete: version={self.weight_version} "
-                f"chunks={chunk_count} sync_time={chunks_time:.3f}s total={total_time:.3f}s",
+                f"chunks={chunk_count} flush={flush_time:.3f}s weights_getter={weights_getter_time:.3f}s "
+                f"total_send={total_send_time:.3f}s total_rayget={total_rayget_time:.3f}s "
+                f"chunks_loop={chunks_time:.3f}s total={total_time:.3f}s",
                 flush=True
             )
 
