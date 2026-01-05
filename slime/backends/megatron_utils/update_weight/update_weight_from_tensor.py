@@ -138,9 +138,10 @@ class UpdateWeightFromTensor:
         if BASELINE_PROFILE and rank == 0:
             chunks_time = time.time() - t_chunks_start
             total_time = time.time() - t_cycle_start
-            logger.info(
+            print(
                 f"[Baseline Profile] Cycle complete: version={self.weight_version} "
-                f"chunks={chunk_count} sync_time={chunks_time:.3f}s total={total_time:.3f}s"
+                f"chunks={chunk_count} sync_time={chunks_time:.3f}s total={total_time:.3f}s",
+                flush=True
             )
 
         dist.barrier(group=get_gloo_group())
@@ -250,11 +251,12 @@ def _send_to_colocated_engine(
             world_size = dist.get_world_size(ipc_gather_group)
             total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
             gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
-            logger.info(
+            print(
                 f"[Baseline Profile] rank={rank} n_tensors={len(hf_named_tensors)} "
                 f"data_mb={total_gathered_mb:.1f} "
                 f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
-                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s"
+                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s",
+                flush=True
             )
 
     return refs, long_live_tensors
