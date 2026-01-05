@@ -187,6 +187,9 @@ def _send_to_colocated_engine(
     # TODO improve
     long_live_tensors = []
 
+    # DEBUG: 无条件打印，测试日志是否可见
+    print(f"[DEBUG] _send_to_colocated_engine called, rank={dist.get_rank()}, n_tensors={len(hf_named_tensors)}", flush=True)
+
     # --- PROFILING: Start ---
     if _is_baseline_profile_enabled():
         t_start = time.time()
