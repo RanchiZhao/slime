@@ -1,3 +1,6 @@
+import logging
+import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -10,6 +13,9 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from slime.utils.distributed_utils import get_gloo_group
+
+logger = logging.getLogger(__name__)
+BASELINE_PROFILE = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -107,6 +113,9 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
         """
+        if BASELINE_PROFILE:
+            t_cycle_start = time.time()
+
         self.weight_version += 1
 
         rank = dist.get_rank()
@@ -114,12 +123,25 @@ class UpdateWeightFromTensor:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
+        if BASELINE_PROFILE:
+            t_chunks_start = time.time()
+
         megatron_local_weights = self.weights_getter()
 
+        chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
             ray.get(refs)
             del long_lived_tensors
+            chunk_count += 1
+
+        if BASELINE_PROFILE and rank == 0:
+            chunks_time = time.time() - t_chunks_start
+            total_time = time.time() - t_cycle_start
+            logger.info(
+                f"[Baseline Profile] Cycle complete: version={self.weight_version} "
+                f"chunks={chunk_count} sync_time={chunks_time:.3f}s total={total_time:.3f}s"
+            )
 
         dist.barrier(group=get_gloo_group())
 
@@ -160,6 +182,11 @@ def _send_to_colocated_engine(
     # TODO improve
     long_live_tensors = []
 
+    # --- PROFILING: Start ---
+    if BASELINE_PROFILE:
+        t_start = time.time()
+        total_bytes = 0
+
     if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
     else:
@@ -174,12 +201,20 @@ def _send_to_colocated_engine(
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
         flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+            "flattened_tensor": flattened_tensor,
             "metadata": metadata,
         }
         long_live_tensors.append(flattened_tensor_data)
         serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+
+        if BASELINE_PROFILE:
+            total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
+
+    if BASELINE_PROFILE:
+        serialize_time = time.time() - t_start
+        t_gather_start = time.time()
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -190,6 +225,10 @@ def _send_to_colocated_engine(
         dst=ipc_gather_src,
         group=ipc_gather_group,
     )
+
+    if BASELINE_PROFILE:
+        gather_time = time.time() - t_gather_start
+        t_ray_start = time.time()
 
     refs = []
     if dist.get_rank() == ipc_gather_src:
@@ -202,5 +241,20 @@ def _send_to_colocated_engine(
                 "weight_version": str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
+
+    if BASELINE_PROFILE:
+        ray_time = time.time() - t_ray_start
+        total_time = time.time() - t_start
+        rank = dist.get_rank()
+        if rank == ipc_gather_src:
+            world_size = dist.get_world_size(ipc_gather_group)
+            total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
+            gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
+            logger.info(
+                f"[Baseline Profile] rank={rank} n_tensors={len(hf_named_tensors)} "
+                f"data_mb={total_gathered_mb:.1f} "
+                f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
+                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s"
+            )
 
     return refs, long_live_tensors
