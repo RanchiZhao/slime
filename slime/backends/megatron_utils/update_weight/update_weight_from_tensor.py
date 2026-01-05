@@ -15,7 +15,11 @@ from ray.actor import ActorHandle
 from slime.utils.distributed_utils import get_gloo_group
 
 logger = logging.getLogger(__name__)
-BASELINE_PROFILE = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
+
+
+def _is_baseline_profile_enabled():
+    """Check at runtime, not import time, because Ray sets env vars after import."""
+    return os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -113,7 +117,7 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
         """
-        if BASELINE_PROFILE:
+        if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
 
         self.weight_version += 1
@@ -123,7 +127,7 @@ class UpdateWeightFromTensor:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
-        if BASELINE_PROFILE:
+        if _is_baseline_profile_enabled():
             t_chunks_start = time.time()
 
         megatron_local_weights = self.weights_getter()
@@ -135,7 +139,7 @@ class UpdateWeightFromTensor:
             del long_lived_tensors
             chunk_count += 1
 
-        if BASELINE_PROFILE and rank == 0:
+        if _is_baseline_profile_enabled() and rank == 0:
             chunks_time = time.time() - t_chunks_start
             total_time = time.time() - t_cycle_start
             print(
@@ -184,7 +188,7 @@ def _send_to_colocated_engine(
     long_live_tensors = []
 
     # --- PROFILING: Start ---
-    if BASELINE_PROFILE:
+    if _is_baseline_profile_enabled():
         t_start = time.time()
         total_bytes = 0
 
@@ -210,10 +214,10 @@ def _send_to_colocated_engine(
         long_live_tensors.append(flattened_tensor_data)
         serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
 
-        if BASELINE_PROFILE:
+        if _is_baseline_profile_enabled():
             total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
 
-    if BASELINE_PROFILE:
+    if _is_baseline_profile_enabled():
         serialize_time = time.time() - t_start
         t_gather_start = time.time()
 
@@ -227,7 +231,7 @@ def _send_to_colocated_engine(
         group=ipc_gather_group,
     )
 
-    if BASELINE_PROFILE:
+    if _is_baseline_profile_enabled():
         gather_time = time.time() - t_gather_start
         t_ray_start = time.time()
 
@@ -243,7 +247,7 @@ def _send_to_colocated_engine(
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
-    if BASELINE_PROFILE:
+    if _is_baseline_profile_enabled():
         ray_time = time.time() - t_ray_start
         total_time = time.time() - t_start
         rank = dist.get_rank()
