@@ -164,11 +164,12 @@ class UpdateWeightFromTensor:
             del long_lived_tensors
             chunk_count += 1
 
-        if _is_baseline_profile_enabled() and rank == 0:
+        if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
             total_time = time.time() - t_cycle_start
+            # 从所有 rank 打印总结信息（只打印一次，Ray 会聚合）
             print(
-                f"[Baseline Profile] Cycle complete: version={self.weight_version} "
+                f"[Baseline Profile] Cycle complete: rank={rank} version={self.weight_version} "
                 f"chunks={chunk_count} flush={flush_time:.3f}s weights_getter={weights_getter_time:.3f}s "
                 f"total_send={total_send_time:.3f}s total_rayget={total_rayget_time:.3f}s "
                 f"chunks_loop={chunks_time:.3f}s total={total_time:.3f}s",
