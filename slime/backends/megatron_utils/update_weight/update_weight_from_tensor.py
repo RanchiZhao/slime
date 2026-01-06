@@ -178,21 +178,27 @@ class UpdateWeightFromTensor:
             refs = []
             if rank == 0:
                 import sys
+                import traceback
                 print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: about to send to {len(self.rollout_engines)} engines", file=sys.stderr, flush=True)
                 for i, engine in enumerate(self.rollout_engines):
-                    t_remote = time.time()
-                    print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sending to engine {i}...", file=sys.stderr, flush=True)
-                    logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sending to engine {i}...")
-                    ref = engine.update_weights_from_tensor.remote(
-                        serialized_named_tensors=[serialized],
-                        load_format="flattened_bucket",
-                        weight_version=str(self.weight_version),
-                    )
-                    refs.append(ref)
-                    remote_time = time.time() - t_remote
-                    print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s", file=sys.stderr, flush=True)
-                    logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s")
-                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: all engines sent, calling ray.get", file=sys.stderr, flush=True)
+                    try:
+                        t_remote = time.time()
+                        print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sending to engine {i}...", file=sys.stderr, flush=True)
+                        logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sending to engine {i}...")
+                        ref = engine.update_weights_from_tensor.remote(
+                            serialized_named_tensors=[serialized],
+                            load_format="flattened_bucket",
+                            weight_version=str(self.weight_version),
+                        )
+                        refs.append(ref)
+                        remote_time = time.time() - t_remote
+                        print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s", file=sys.stderr, flush=True)
+                        logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s")
+                    except Exception as e:
+                        print(f"[WEIGHT-SYNC-ERROR] rank=0 chunk={chunk_count}: FAILED to send to engine {i}: {e}", file=sys.stderr, flush=True)
+                        traceback.print_exc(file=sys.stderr)
+                        raise
+                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: all {len(refs)} engines sent, calling ray.get", file=sys.stderr, flush=True)
 
             chunk_count += 1
 
