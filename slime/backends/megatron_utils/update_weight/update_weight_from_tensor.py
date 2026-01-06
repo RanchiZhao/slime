@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 import time
@@ -5,6 +6,7 @@ from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+import pybase64
 import ray
 import torch
 import torch.distributed as dist
@@ -201,8 +203,8 @@ class UpdateWeightFromTensor:
     def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
         """Serialize a chunk of HF tensors to string.
 
-        Move tensors to CPU before serialization to avoid device UUID issues
-        when deserializing on different nodes.
+        Use torch.save instead of ForkingPickler to support cross-node transfer.
+        ForkingPickler uses fd sharing which only works within the same machine.
         """
         # Move tensors to CPU to avoid device UUID issues in cross-node deserialization
         cpu_named_tensors = [(name, tensor.cpu()) for name, tensor in hf_named_tensors]
@@ -231,7 +233,11 @@ class UpdateWeightFromTensor:
                 "flattened_tensor": flattened_tensor,
                 "metadata": metadata,
             }
-            return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+            # Use torch.save instead of ForkingPickler for cross-node compatibility
+            # Prefix with "TORCH:" to indicate the format for deserialization
+            buffer = io.BytesIO()
+            torch.save(flattened_tensor_data, buffer)
+            return "TORCH:" + pybase64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
