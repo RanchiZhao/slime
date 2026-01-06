@@ -157,6 +157,14 @@ class UpdateWeightFromTensor:
 
             ray.get(refs)
 
+            # CRITICAL: Sync all ranks after ray.get to prevent deadlock
+            # Without this barrier:
+            # - non-gather_src ranks have empty refs, ray.get([]) returns immediately
+            # - gather_src ranks wait for SGLang to complete
+            # - non-gather_src ranks proceed to next chunk and hit barrier in _send_to_colocated_engine
+            # - gather_src ranks are still waiting on ray.get → DEADLOCK
+            dist.barrier(group=self._ipc_gather_group)
+
             if _is_baseline_profile_enabled():
                 rayget_time = time.time() - t_rayget_start
                 total_rayget_time += rayget_time
