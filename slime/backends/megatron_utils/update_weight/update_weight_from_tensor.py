@@ -21,21 +21,16 @@ print(f"[WEIGHT-SYNC-MODULE] update_weight_from_tensor.py loaded", flush=True)
 
 
 def _debug_log(msg: str, rank: int = -1):
-    """Write debug log to file for rank 0, guaranteed to capture output."""
+    """Write debug log to file for rank 0."""
     if rank != 0:
         return
-    # 先无条件打印到 stdout
-    print(f"[RANK0-DEBUG] {msg}", flush=True)
-    # 再尝试写文件
-    try:
-        import socket
-        hostname = socket.gethostname()
-        for path in ["/tmp/weight_sync_debug.log", f"/tmp/weight_sync_rank0_{hostname}.log"]:
-            with open(path, "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-                f.flush()
-    except Exception as e:
-        print(f"[RANK0-DEBUG] WARNING: Failed to write log file: {e}", flush=True)
+    import socket
+    hostname = socket.gethostname()
+    with open(f"/tmp/rank0_debug_{hostname}.log", "a") as f:
+        f.write(f"{msg}\n")
+        f.flush()
+        import os
+        os.fsync(f.fileno())  # 强制刷新到磁盘
 
 
 def _is_baseline_profile_enabled():
