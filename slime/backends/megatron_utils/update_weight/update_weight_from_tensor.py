@@ -220,12 +220,27 @@ class UpdateWeightFromTensor:
             metadata = flattened_tensor_bucket.get_metadata()
             flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
 
+            # Print tensor size for analysis
+            tensor_mb = flattened_tensor.numel() * flattened_tensor.element_size() / (1024 * 1024)
+
             flattened_tensor_data = {
                 "flattened_tensor": flattened_tensor,
                 "metadata": metadata,
             }
             # Use ForkingPickler (fast) - SGLang handles UUID mismatch
-            return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+            serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+
+            # KEY DEBUG: Compare tensor size vs serialized string size
+            serialized_mb = len(serialized) / (1024 * 1024)
+            rank = dist.get_rank()
+            if rank == 0 and _is_baseline_profile_enabled():
+                print(
+                    f"[Serialize Analysis] tensor_mb={tensor_mb:.1f} serialized_mb={serialized_mb:.1f} "
+                    f"ratio={serialized_mb/tensor_mb:.2f}x device={flattened_tensor.device}",
+                    flush=True
+                )
+
+            return serialized
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
