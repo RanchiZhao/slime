@@ -222,6 +222,11 @@ class UpdateWeightFromTensor:
             flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             metadata = flattened_tensor_bucket.get_metadata()
             flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+
+            # Ensure flattened tensor is on CPU before serialization
+            if flattened_tensor.is_cuda:
+                flattened_tensor = flattened_tensor.cpu()
+
             flattened_tensor_data = {
                 "flattened_tensor": flattened_tensor,
                 "metadata": metadata,
