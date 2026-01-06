@@ -199,12 +199,19 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
     def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
-        """Serialize a chunk of HF tensors to string."""
+        """Serialize a chunk of HF tensors to string.
+
+        Move tensors to CPU before serialization to avoid device UUID issues
+        when deserializing on different nodes.
+        """
+        # Move tensors to CPU to avoid device UUID issues in cross-node deserialization
+        cpu_named_tensors = [(name, tensor.cpu()) for name, tensor in hf_named_tensors]
+
         if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+            converted_named_tensors_by_dtypes = {"dtype": cpu_named_tensors}
         else:
             converted_named_tensors_by_dtypes = {}
-            for name, tensor in hf_named_tensors:
+            for name, tensor in cpu_named_tensors:
                 dtype = tensor.dtype
                 if dtype not in converted_named_tensors_by_dtypes:
                     converted_named_tensors_by_dtypes[dtype] = []
