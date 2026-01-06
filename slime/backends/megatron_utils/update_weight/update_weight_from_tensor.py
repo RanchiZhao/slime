@@ -16,6 +16,9 @@ from slime.utils.distributed_utils import get_gloo_group
 
 logger = logging.getLogger(__name__)
 
+# Module-level marker to verify this file is being loaded
+print(f"[WEIGHT-SYNC-MODULE] update_weight_from_tensor.py loaded, commit=849902f", flush=True)
+
 
 def _is_baseline_profile_enabled():
     """Check at runtime, not import time, because Ray sets env vars after import."""
@@ -122,12 +125,14 @@ class UpdateWeightFromTensor:
         - rank 0 already has handles to all engines (see flush_cache)
         - All other ranks only do NCCL communication and serialization
         """
+        # CRITICAL: Log from ALL ranks at the very start to confirm this code is being executed
+        rank = dist.get_rank()
+        logger.warning(f"[WEIGHT-SYNC] *** ENTERING update_weights *** rank={rank} version={self.weight_version + 1}")
+
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
 
         self.weight_version += 1
-
-        rank = dist.get_rank()
 
         if _is_baseline_profile_enabled():
             t_flush_start = time.time()
