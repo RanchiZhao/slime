@@ -1,5 +1,7 @@
 import inspect
+import os
 import re
+import time
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
 
@@ -10,6 +12,11 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
+
+
+def _is_deep_profile_enabled():
+    """Check at runtime for deep profiling mode."""
+    return os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
 
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
@@ -56,11 +63,14 @@ def all_gather_params_async(
     dist.all_gather(async_op=True) on expert-TP/regular-TP group (skip expert_bias/non-TP/duplicated).
     Loop 2: wait all NCCL handles (enables overlap). Loop 3: concat partitions + apply GLU rechunk/MoE dim fix.
     """
+    deep_profile = _is_deep_profile_enabled()
+    rank = dist.get_rank()
+
     # Phase 1: Start all async all_gather operations
     gather_tasks = []
     handles = []
 
-    for info, param in param_infos_and_params:
+    for idx, (info, param) in enumerate(param_infos_and_params):
         # Prepare async all_gather
         if "expert_bias" in info.name:
             gather_tasks.append((info, param, None, None, None))
@@ -78,23 +88,43 @@ def all_gather_params_async(
                 tp_group = mpu.get_tensor_model_parallel_group()
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
-            handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
-            handles.append(handle)
 
-    # Phase 2: Wait for ALL async operations to complete at once
+            if deep_profile:
+                # Per-tensor timing for deep profiling
+                t0 = time.time()
+                handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
+                handle.wait()
+                elapsed = time.time() - t0
+                size_mb = param.data.numel() * param.data.element_size() / 1e6
+                throughput_gbs = (size_mb * tp_size) / elapsed / 1000 if elapsed > 0 else 0
+                if rank == 0 and idx < 10:  # Only log first 10 params from rank 0
+                    print(
+                        f"[NCCL Deep] #{idx} {info.name[:40]:40s} "
+                        f"size={size_mb:.1f}MB time={elapsed*1000:.2f}ms "
+                        f"throughput={throughput_gbs:.1f}GB/s",
+                        flush=True
+                    )
+                gather_tasks.append((info, None, None, param_partitions, param.partition_dim))
+                handles.append(None)  # Already waited
+            else:
+                handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
+                gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
+                handles.append(handle)
+
+    # Phase 2: Wait for ALL async operations to complete at once (if not deep profiling)
     # This ensures maximum parallelism by not blocking on individual operations
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
+    if not deep_profile:
+        for handle in handles:
+            if handle is not None:
+                handle.wait()
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
     for info, direct_param, handle, param_partitions, partition_dim in gather_tasks:
-        if handle is None:
+        if handle is None and direct_param is not None:
             # No all_gather needed
             param = direct_param
-        else:
+        elif param_partitions is not None:
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_stride != 1 is not supported"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
@@ -107,6 +137,9 @@ def all_gather_params_async(
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)
+        else:
+            # This case should not happen
+            param = direct_param
 
         gathered_params.append(param)
 

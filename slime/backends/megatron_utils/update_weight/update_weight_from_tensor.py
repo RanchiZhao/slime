@@ -21,6 +21,11 @@ def _is_baseline_profile_enabled():
     """Check at runtime, not import time, because Ray sets env vars after import."""
     return os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
 
+
+def _is_deep_profile_enabled():
+    """Check at runtime for deep profiling mode."""
+    return os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
+
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
@@ -278,6 +283,15 @@ def _send_to_colocated_engine(
         serialize_time = time.time() - t_start
         t_gather_start = time.time()
 
+    # Deep profiling: Gloo network monitoring
+    if _is_deep_profile_enabled():
+        try:
+            import psutil
+            net0 = psutil.net_io_counters()
+        except ImportError:
+            net0 = None
+        t_gloo_start = time.time()
+
     # Gloo gather: collect serialized data from all ranks to gather_src
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == rank else None
@@ -288,6 +302,26 @@ def _send_to_colocated_engine(
         dst=ipc_gather_src,
         group=ipc_gather_group,
     )
+
+    # Deep profiling: log Gloo network stats
+    if _is_deep_profile_enabled():
+        gloo_time = time.time() - t_gloo_start
+        if net0 is not None:
+            try:
+                net1 = psutil.net_io_counters()
+                bytes_xfer = (net1.bytes_sent - net0.bytes_sent + net1.bytes_recv - net0.bytes_recv)
+                if rank == ipc_gather_src:
+                    log_msg = f"[Gloo Deep] rank={rank} time={gloo_time*1000:.1f}ms bytes_xfer={bytes_xfer/1e6:.1f}MB"
+                    print(log_msg, flush=True)
+                    try:
+                        with open("/mnt/hisys-data/yqzhao/deep_profile.log", "a") as f:
+                            f.write(log_msg + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     if _is_baseline_profile_enabled():
         gather_time = time.time() - t_gather_start
@@ -304,6 +338,9 @@ def _send_to_colocated_engine(
                 "load_format": "flattened_bucket",
                 "weight_version": str(weight_version),
             }
+            # Deep profiling: add submit timestamp for Ray latency measurement
+            if _is_deep_profile_enabled():
+                kwargs["_submit_ts"] = time.time()
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
     if _is_baseline_profile_enabled():

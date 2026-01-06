@@ -23,6 +23,11 @@ def _is_baseline_profile_enabled():
     return os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
 
 
+def _is_deep_profile_enabled():
+    """Check at runtime for deep profiling mode."""
+    return os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
+
+
 class HfWeightIteratorDirect(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
