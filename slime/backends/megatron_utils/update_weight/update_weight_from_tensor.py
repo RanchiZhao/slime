@@ -216,10 +216,10 @@ def _send_to_colocated_engine(
     Send HF weights to colocated SGLang engine.
 
     Optimization: After PP/EP/TP communication, all ranks have identical complete HF weights.
-    So we only need ONE rank to serialize and send, instead of gathering 64 identical copies.
+    So we only need ONE rank to send, instead of gathering 64 identical copies.
 
-    Original flow: 64 ranks serialize → Gloo gather to rank 0 → send 64 copies to SGLang
-    Optimized flow: Only gather_src rank serializes → directly send 1 copy to SGLang
+    Original flow: 64 ranks serialize → Gloo gather → send 64 copies
+    Optimized flow: All ranks serialize (for CUDA sync) → only gather_src sends 1 copy
     """
     rank = dist.get_rank()
     long_live_tensors = []
@@ -230,41 +230,40 @@ def _send_to_colocated_engine(
         t_start = time.time()
         total_bytes = 0
 
-    # Only gather_src rank needs to serialize and send
-    if rank == ipc_gather_src:
-        # Group tensors by dtype if needed
-        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
-        else:
-            converted_named_tensors_by_dtypes = {}
-            for name, tensor in hf_named_tensors:
-                dtype = tensor.dtype
-                if dtype not in converted_named_tensors_by_dtypes:
-                    converted_named_tensors_by_dtypes[dtype] = []
-                converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+    # All ranks do serialization (needed for CUDA synchronization)
+    # Group tensors by dtype if needed
+    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+    else:
+        converted_named_tensors_by_dtypes = {}
+        for name, tensor in hf_named_tensors:
+            dtype = tensor.dtype
+            if dtype not in converted_named_tensors_by_dtypes:
+                converted_named_tensors_by_dtypes[dtype] = []
+            converted_named_tensors_by_dtypes[dtype].append((name, tensor))
 
-        # Serialize tensors
-        serialized_tensors = []
-        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-            metadata = flattened_tensor_bucket.get_metadata()
-            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-            flattened_tensor_data = {
-                "flattened_tensor": flattened_tensor,
-                "metadata": metadata,
-            }
-            long_live_tensors.append(flattened_tensor_data)
-            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
-
-            if _is_baseline_profile_enabled():
-                total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
+    # Serialize tensors (all ranks do this for CUDA sync)
+    serialized_tensors = []
+    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        metadata = flattened_tensor_bucket.get_metadata()
+        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+        flattened_tensor_data = {
+            "flattened_tensor": flattened_tensor,
+            "metadata": metadata,
+        }
+        long_live_tensors.append(flattened_tensor_data)
+        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
 
         if _is_baseline_profile_enabled():
-            serialize_time = time.time() - t_start
-            t_ray_start = time.time()
+            total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
 
-        # Send directly to SGLang engine (no gather needed)
-        # Send as a list with single element for each dtype
+    if _is_baseline_profile_enabled():
+        serialize_time = time.time() - t_start
+        t_send_start = time.time()
+
+    # Only gather_src rank sends (skip the redundant Gloo gather)
+    if rank == ipc_gather_src:
         for i in range(len(serialized_tensors)):
             kwargs = {
                 "serialized_named_tensors": [serialized_tensors[i]],  # Single copy, wrapped in list
@@ -273,27 +272,26 @@ def _send_to_colocated_engine(
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
-        if _is_baseline_profile_enabled():
-            ray_time = time.time() - t_ray_start
-            total_time = time.time() - t_start
-            total_mb = total_bytes / (1024 * 1024)
+    if _is_baseline_profile_enabled():
+        send_time = time.time() - t_send_start
+        total_time = time.time() - t_start
+        total_mb = total_bytes / (1024 * 1024)
+        if rank == ipc_gather_src:
             print(
                 f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} n_tensors={len(hf_named_tensors)} "
                 f"data_mb={total_mb:.1f} "
                 f"serialize={serialize_time:.3f}s gather=0.000s (skipped) "
-                f"ray={ray_time:.3f}s total={total_time:.3f}s",
+                f"send={send_time:.3f}s total={total_time:.3f}s",
                 flush=True
             )
-    else:
-        # Other ranks don't need to do anything, just wait for barrier
-        if _is_baseline_profile_enabled():
-            # Still print for consistency in logs
+        else:
             print(
-                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} (non-src rank, skipped)",
+                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} "
+                f"serialize={serialize_time:.3f}s (non-src, no send)",
                 flush=True
             )
 
-    # Synchronization point: ensure send completes before continuing
+    # Synchronization point: ensure all ranks finish before continuing
     dist.barrier(group=ipc_gather_group)
 
     return refs, long_live_tensors
