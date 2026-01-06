@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 print(f"[WEIGHT-SYNC-MODULE] update_weight_from_tensor.py loaded", flush=True)
 
 
+def _debug_log(msg: str, rank: int = -1):
+    """Write debug log to file for rank 0, guaranteed to capture output."""
+    if rank != 0:
+        return
+    try:
+        with open("/tmp/weight_sync_debug.log", "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass  # Silent fail if can't write
+
+
 def _is_baseline_profile_enabled():
     """Check at runtime, not import time, because Ray sets env vars after import."""
     return os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
@@ -125,14 +137,9 @@ class UpdateWeightFromTensor:
         - rank 0 already has handles to all engines (see flush_cache)
         - All other ranks only do NCCL communication and serialization
         """
-        # CRITICAL: Log from ALL ranks at the very start to confirm this code is being executed
         rank = dist.get_rank()
+        _debug_log(f"ENTERING update_weights, version={self.weight_version + 1}, num_engines={len(self.rollout_engines)}", rank)
         logger.info(f"[WEIGHT-SYNC] *** ENTERING update_weights *** rank={rank} version={self.weight_version + 1}")
-
-        # Write to stderr for rank 0 to ensure visibility
-        if rank == 0:
-            import sys
-            print(f"[WEIGHT-SYNC-STDERR] rank=0 entering update_weights, num_engines={len(self.rollout_engines)}", file=sys.stderr, flush=True)
 
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -142,49 +149,42 @@ class UpdateWeightFromTensor:
         if _is_baseline_profile_enabled():
             t_flush_start = time.time()
 
+        _debug_log(f"Starting flush_cache for {len(self.rollout_engines)} engines", rank)
         if rank == 0:
-            logger.info(f"[WEIGHT-SYNC] rank=0 flush_cache: num_engines={len(self.rollout_engines)}")
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            logger.info(f"[WEIGHT-SYNC] rank=0 flush_cache: DONE")
+        _debug_log("flush_cache DONE, entering barrier", rank)
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
             flush_time = time.time() - t_flush_start
             t_weights_getter_start = time.time()
 
+        _debug_log("Getting weights...", rank)
         megatron_local_weights = self.weights_getter()
+        _debug_log("Weights obtained", rank)
 
         if _is_baseline_profile_enabled():
             weights_getter_time = time.time() - t_weights_getter_start
             t_chunks_start = time.time()
 
-        # Log from representative ranks: 0 (master), 64 (second engine group), 1 (worker in group 0)
-        debug_ranks = {0, 1, 64, 65}
-
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            if rank in debug_ranks and chunk_count < 3:
-                logger.info(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count}: got tensors, n={len(hf_named_tensors)}")
+            _debug_log(f"Chunk {chunk_count}: got {len(hf_named_tensors)} tensors", rank)
 
             # All ranks serialize (for CUDA sync)
             t_serialize = time.time()
             serialized = self._serialize_chunk(hf_named_tensors)
             serialize_time = time.time() - t_serialize
-
-            if rank in debug_ranks and chunk_count < 3:
-                logger.info(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count}: serialized in {serialize_time:.3f}s")
+            _debug_log(f"Chunk {chunk_count}: serialized in {serialize_time:.3f}s, len={len(serialized)}", rank)
 
             # Only rank 0 sends to ALL engines
             refs = []
             if rank == 0:
-                import sys
-                import traceback
-                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: about to send to {len(self.rollout_engines)} engines", file=sys.stderr, flush=True)
+                _debug_log(f"Chunk {chunk_count}: about to send to {len(self.rollout_engines)} engines", rank)
                 for i, engine in enumerate(self.rollout_engines):
                     try:
+                        _debug_log(f"Chunk {chunk_count}: sending to engine {i} (type={type(engine).__name__})...", rank)
                         t_remote = time.time()
-                        print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sending to engine {i}...", file=sys.stderr, flush=True)
-                        logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sending to engine {i}...")
                         ref = engine.update_weights_from_tensor.remote(
                             serialized_named_tensors=[serialized],
                             load_format="flattened_bucket",
@@ -192,29 +192,27 @@ class UpdateWeightFromTensor:
                         )
                         refs.append(ref)
                         remote_time = time.time() - t_remote
-                        print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s", file=sys.stderr, flush=True)
-                        logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s")
+                        _debug_log(f"Chunk {chunk_count}: engine {i} sent in {remote_time:.3f}s, ref={ref}", rank)
                     except Exception as e:
-                        print(f"[WEIGHT-SYNC-ERROR] rank=0 chunk={chunk_count}: FAILED to send to engine {i}: {e}", file=sys.stderr, flush=True)
-                        traceback.print_exc(file=sys.stderr)
+                        _debug_log(f"Chunk {chunk_count}: FAILED engine {i}: {type(e).__name__}: {e}", rank)
+                        import traceback
+                        _debug_log(f"Traceback: {traceback.format_exc()}", rank)
                         raise
-                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: all {len(refs)} engines sent, calling ray.get", file=sys.stderr, flush=True)
+                _debug_log(f"Chunk {chunk_count}: all {len(refs)} refs collected, calling ray.get", rank)
 
             chunk_count += 1
 
             # rank 0 waits for Ray, then ALL ranks sync before next chunk
             if rank == 0:
-                logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count-1}: calling ray.get on {len(refs)} refs...")
+                _debug_log(f"Chunk {chunk_count-1}: ray.get on {len(refs)} refs...", rank)
                 t_rayget = time.time()
                 ray.get(refs)
                 rayget_time = time.time() - t_rayget
-                logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count-1}: ray.get done in {rayget_time:.3f}s")
+                _debug_log(f"Chunk {chunk_count-1}: ray.get done in {rayget_time:.3f}s", rank)
 
-            if rank in debug_ranks and chunk_count <= 3:
-                logger.info(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count-1}: entering barrier...")
-            dist.barrier(group=get_gloo_group())  # Sync AFTER ray.get!
-            if rank in debug_ranks and chunk_count <= 3:
-                logger.info(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count-1}: barrier done")
+            _debug_log(f"Chunk {chunk_count-1}: entering barrier", rank)
+            dist.barrier(group=get_gloo_group())
+            _debug_log(f"Chunk {chunk_count-1}: barrier done", rank)
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
@@ -226,7 +224,9 @@ class UpdateWeightFromTensor:
                 flush=True
             )
 
+        _debug_log(f"All {chunk_count} chunks done, final barrier", rank)
         dist.barrier(group=get_gloo_group())
+        _debug_log("update_weights COMPLETE", rank)
 
     def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
         """Serialize a chunk of HF tensors to string."""
