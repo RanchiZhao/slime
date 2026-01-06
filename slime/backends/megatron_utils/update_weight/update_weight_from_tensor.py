@@ -137,8 +137,11 @@ class UpdateWeightFromTensor:
         """
         rank = dist.get_rank()
 
-        # 直接打印，不经过任何函数
-        print(f"[DEBUG-DIRECT] rank={rank} ENTERING update_weights, num_engines={len(self.rollout_engines)}", flush=True)
+        # 写到共享存储，一定能看到
+        if rank == 0:
+            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                f.write(f"ENTERING update_weights, num_engines={len(self.rollout_engines)}\n")
+                f.flush()
 
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -149,9 +152,13 @@ class UpdateWeightFromTensor:
             t_flush_start = time.time()
 
         if rank == 0:
-            print(f"[DEBUG-DIRECT] rank=0 calling flush_cache on {len(self.rollout_engines)} engines", flush=True)
+            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                f.write(f"calling flush_cache on {len(self.rollout_engines)} engines\n")
+                f.flush()
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            print(f"[DEBUG-DIRECT] rank=0 flush_cache DONE", flush=True)
+            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                f.write("flush_cache DONE\n")
+                f.flush()
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
@@ -172,25 +179,37 @@ class UpdateWeightFromTensor:
             # Only rank 0 sends to ALL engines
             refs = []
             if rank == 0:
-                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} sending to {len(self.rollout_engines)} engines", flush=True)
+                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                    f.write(f"chunk={chunk_count} sending to {len(self.rollout_engines)} engines\n")
+                    f.flush()
                 for i, engine in enumerate(self.rollout_engines):
-                    print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} engine={i} calling remote()...", flush=True)
+                    with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                        f.write(f"chunk={chunk_count} engine={i} calling remote()...\n")
+                        f.flush()
                     ref = engine.update_weights_from_tensor.remote(
                         serialized_named_tensors=[serialized],
                         load_format="flattened_bucket",
                         weight_version=str(self.weight_version),
                     )
                     refs.append(ref)
-                    print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} engine={i} remote() returned ref={ref}", flush=True)
-                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} all refs collected: {len(refs)}, calling ray.get", flush=True)
+                    with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                        f.write(f"chunk={chunk_count} engine={i} remote() returned\n")
+                        f.flush()
+                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                    f.write(f"chunk={chunk_count} all {len(refs)} refs collected, calling ray.get\n")
+                    f.flush()
 
             chunk_count += 1
 
             # rank 0 waits for Ray, then ALL ranks sync before next chunk
             if rank == 0 and refs:
-                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count-1} ray.get on {len(refs)} refs...", flush=True)
+                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                    f.write(f"chunk={chunk_count-1} ray.get on {len(refs)} refs...\n")
+                    f.flush()
                 ray.get(refs)
-                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count-1} ray.get DONE", flush=True)
+                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
+                    f.write(f"chunk={chunk_count-1} ray.get DONE\n")
+                    f.flush()
 
             dist.barrier(group=get_gloo_group())
 
