@@ -134,13 +134,11 @@ class UpdateWeightFromTensor:
         version++, flush caches, process buckets. Progress on rank 0.
 
         SIMPLIFIED DESIGN: Only rank 0 sends to ALL engines.
-        - Avoids the mystery of why rank 64 doesn't send to engine 1
-        - rank 0 already has handles to all engines (see flush_cache)
-        - All other ranks only do NCCL communication and serialization
         """
         rank = dist.get_rank()
-        _debug_log(f"ENTERING update_weights, version={self.weight_version + 1}, num_engines={len(self.rollout_engines)}", rank)
-        logger.info(f"[WEIGHT-SYNC] *** ENTERING update_weights *** rank={rank} version={self.weight_version + 1}")
+
+        # 直接打印，不经过任何函数
+        print(f"[DEBUG-DIRECT] rank={rank} ENTERING update_weights, num_engines={len(self.rollout_engines)}", flush=True)
 
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -150,19 +148,17 @@ class UpdateWeightFromTensor:
         if _is_baseline_profile_enabled():
             t_flush_start = time.time()
 
-        _debug_log(f"Starting flush_cache for {len(self.rollout_engines)} engines", rank)
         if rank == 0:
+            print(f"[DEBUG-DIRECT] rank=0 calling flush_cache on {len(self.rollout_engines)} engines", flush=True)
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-        _debug_log("flush_cache DONE, entering barrier", rank)
+            print(f"[DEBUG-DIRECT] rank=0 flush_cache DONE", flush=True)
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
             flush_time = time.time() - t_flush_start
             t_weights_getter_start = time.time()
 
-        _debug_log("Getting weights...", rank)
         megatron_local_weights = self.weights_getter()
-        _debug_log("Weights obtained", rank)
 
         if _is_baseline_profile_enabled():
             weights_getter_time = time.time() - t_weights_getter_start
@@ -170,50 +166,33 @@ class UpdateWeightFromTensor:
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            _debug_log(f"Chunk {chunk_count}: got {len(hf_named_tensors)} tensors", rank)
-
             # All ranks serialize (for CUDA sync)
-            t_serialize = time.time()
             serialized = self._serialize_chunk(hf_named_tensors)
-            serialize_time = time.time() - t_serialize
-            _debug_log(f"Chunk {chunk_count}: serialized in {serialize_time:.3f}s, len={len(serialized)}", rank)
 
             # Only rank 0 sends to ALL engines
             refs = []
             if rank == 0:
-                _debug_log(f"Chunk {chunk_count}: about to send to {len(self.rollout_engines)} engines", rank)
+                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} sending to {len(self.rollout_engines)} engines", flush=True)
                 for i, engine in enumerate(self.rollout_engines):
-                    try:
-                        _debug_log(f"Chunk {chunk_count}: sending to engine {i} (type={type(engine).__name__})...", rank)
-                        t_remote = time.time()
-                        ref = engine.update_weights_from_tensor.remote(
-                            serialized_named_tensors=[serialized],
-                            load_format="flattened_bucket",
-                            weight_version=str(self.weight_version),
-                        )
-                        refs.append(ref)
-                        remote_time = time.time() - t_remote
-                        _debug_log(f"Chunk {chunk_count}: engine {i} sent in {remote_time:.3f}s, ref={ref}", rank)
-                    except Exception as e:
-                        _debug_log(f"Chunk {chunk_count}: FAILED engine {i}: {type(e).__name__}: {e}", rank)
-                        import traceback
-                        _debug_log(f"Traceback: {traceback.format_exc()}", rank)
-                        raise
-                _debug_log(f"Chunk {chunk_count}: all {len(refs)} refs collected, calling ray.get", rank)
+                    print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} engine={i} calling remote()...", flush=True)
+                    ref = engine.update_weights_from_tensor.remote(
+                        serialized_named_tensors=[serialized],
+                        load_format="flattened_bucket",
+                        weight_version=str(self.weight_version),
+                    )
+                    refs.append(ref)
+                    print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} engine={i} remote() returned ref={ref}", flush=True)
+                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count} all refs collected: {len(refs)}, calling ray.get", flush=True)
 
             chunk_count += 1
 
             # rank 0 waits for Ray, then ALL ranks sync before next chunk
-            if rank == 0:
-                _debug_log(f"Chunk {chunk_count-1}: ray.get on {len(refs)} refs...", rank)
-                t_rayget = time.time()
+            if rank == 0 and refs:
+                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count-1} ray.get on {len(refs)} refs...", flush=True)
                 ray.get(refs)
-                rayget_time = time.time() - t_rayget
-                _debug_log(f"Chunk {chunk_count-1}: ray.get done in {rayget_time:.3f}s", rank)
+                print(f"[DEBUG-DIRECT] rank=0 chunk={chunk_count-1} ray.get DONE", flush=True)
 
-            _debug_log(f"Chunk {chunk_count-1}: entering barrier", rank)
             dist.barrier(group=get_gloo_group())
-            _debug_log(f"Chunk {chunk_count-1}: barrier done", rank)
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
@@ -225,9 +204,7 @@ class UpdateWeightFromTensor:
                 flush=True
             )
 
-        _debug_log(f"All {chunk_count} chunks done, final barrier", rank)
         dist.barrier(group=get_gloo_group())
-        _debug_log("update_weights COMPLETE", rank)
 
     def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
         """Serialize a chunk of HF tensors to string."""
