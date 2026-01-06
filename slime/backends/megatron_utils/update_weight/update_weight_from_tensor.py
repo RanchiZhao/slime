@@ -270,13 +270,8 @@ def _send_to_colocated_engine(
         serialize_time = time.time() - t_start
         t_send_start = time.time()
 
-    # DEBUG: Always print for gather_src ranks (rank 0 and 64)
-    if rank == ipc_gather_src:
-        print(f"[GATHER_SRC] rank={rank} ipc_gather_src={ipc_gather_src} serialized={len(serialized_tensors)} tensors", flush=True)
-
     # Only gather_src rank sends (skip the redundant Gloo gather)
     if rank == ipc_gather_src:
-        print(f"[GATHER_SRC] rank={rank} SENDING {len(serialized_tensors)} requests to engine...", flush=True)
         for i in range(len(serialized_tensors)):
             kwargs = {
                 "serialized_named_tensors": [serialized_tensors[i]],  # Single copy, wrapped in list
@@ -284,24 +279,17 @@ def _send_to_colocated_engine(
                 "weight_version": str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
-        print(f"[GATHER_SRC] rank={rank} SENT {len(refs)} requests successfully", flush=True)
 
     if _is_baseline_profile_enabled():
         send_time = time.time() - t_send_start
         total_time = time.time() - t_start
         total_mb = total_bytes / (1024 * 1024)
+        # Only log from gather_src ranks to reduce noise
         if rank == ipc_gather_src:
             print(
-                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} n_tensors={len(hf_named_tensors)} "
+                f"[Baseline Profile] rank={rank} n_tensors={len(hf_named_tensors)} "
                 f"data_mb={total_mb:.1f} "
-                f"serialize={serialize_time:.3f}s gather=0.000s (skipped) "
-                f"send={send_time:.3f}s total={total_time:.3f}s",
-                flush=True
-            )
-        else:
-            print(
-                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} "
-                f"serialize={serialize_time:.3f}s (non-src, no send)",
+                f"serialize={serialize_time:.3f}s send={send_time:.3f}s total={total_time:.3f}s",
                 flush=True
             )
 
