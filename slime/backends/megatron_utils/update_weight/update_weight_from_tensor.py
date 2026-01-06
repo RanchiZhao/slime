@@ -212,83 +212,88 @@ def _send_to_colocated_engine(
     ipc_gather_group,
     weight_version,
 ) -> tuple[list[ObjectRef], Any]:
-    # TODO improve
+    """
+    Send HF weights to colocated SGLang engine.
+
+    Optimization: After PP/EP/TP communication, all ranks have identical complete HF weights.
+    So we only need ONE rank to serialize and send, instead of gathering 64 identical copies.
+
+    Original flow: 64 ranks serialize → Gloo gather to rank 0 → send 64 copies to SGLang
+    Optimized flow: Only gather_src rank serializes → directly send 1 copy to SGLang
+    """
+    rank = dist.get_rank()
     long_live_tensors = []
+    refs = []
 
     # --- PROFILING: Start ---
     if _is_baseline_profile_enabled():
         t_start = time.time()
         total_bytes = 0
 
-    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-        converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
-    else:
-        converted_named_tensors_by_dtypes = {}
-        for name, tensor in hf_named_tensors:
-            dtype = tensor.dtype
-            if dtype not in converted_named_tensors_by_dtypes:
-                converted_named_tensors_by_dtypes[dtype] = []
-            converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+    # Only gather_src rank needs to serialize and send
+    if rank == ipc_gather_src:
+        # Group tensors by dtype if needed
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+        else:
+            converted_named_tensors_by_dtypes = {}
+            for name, tensor in hf_named_tensors:
+                dtype = tensor.dtype
+                if dtype not in converted_named_tensors_by_dtypes:
+                    converted_named_tensors_by_dtypes[dtype] = []
+                converted_named_tensors_by_dtypes[dtype].append((name, tensor))
 
-    serialized_tensors = []
-    for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor,
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        # Serialize tensors
+        serialized_tensors = []
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            metadata = flattened_tensor_bucket.get_metadata()
+            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor,
+                "metadata": metadata,
+            }
+            long_live_tensors.append(flattened_tensor_data)
+            serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+
+            if _is_baseline_profile_enabled():
+                total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
 
         if _is_baseline_profile_enabled():
-            total_bytes += flattened_tensor.numel() * flattened_tensor.element_size()
+            serialize_time = time.time() - t_start
+            t_ray_start = time.time()
 
-    if _is_baseline_profile_enabled():
-        serialize_time = time.time() - t_start
-        t_gather_start = time.time()
-
-    serialized_named_tensors = (
-        [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
-    )
-    dist.gather_object(
-        serialized_tensors,
-        object_gather_list=serialized_named_tensors,
-        dst=ipc_gather_src,
-        group=ipc_gather_group,
-    )
-
-    if _is_baseline_profile_enabled():
-        gather_time = time.time() - t_gather_start
-        t_ray_start = time.time()
-
-    refs = []
-    if dist.get_rank() == ipc_gather_src:
-        # TODO: here we assume all ranks have the same number of dtypes, not sure if that is correct.
-        num_dtypes = len(serialized_named_tensors[0])
-        for i in range(num_dtypes):
+        # Send directly to SGLang engine (no gather needed)
+        # Send as a list with single element for each dtype
+        for i in range(len(serialized_tensors)):
             kwargs = {
-                "serialized_named_tensors": [tensors[i] for tensors in serialized_named_tensors],
+                "serialized_named_tensors": [serialized_tensors[i]],  # Single copy, wrapped in list
                 "load_format": "flattened_bucket",
                 "weight_version": str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
 
-    if _is_baseline_profile_enabled():
-        ray_time = time.time() - t_ray_start
-        total_time = time.time() - t_start
-        rank = dist.get_rank()
-        # 所有 rank 都打印，因为 Ray 日志可能只收集部分 rank
-        world_size = dist.get_world_size(ipc_gather_group)
-        total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
-        gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
-        print(
-            f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} n_tensors={len(hf_named_tensors)} "
-            f"data_mb={total_gathered_mb:.1f} "
-            f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
-            f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s",
-            flush=True
-        )
+        if _is_baseline_profile_enabled():
+            ray_time = time.time() - t_ray_start
+            total_time = time.time() - t_start
+            total_mb = total_bytes / (1024 * 1024)
+            print(
+                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} n_tensors={len(hf_named_tensors)} "
+                f"data_mb={total_mb:.1f} "
+                f"serialize={serialize_time:.3f}s gather=0.000s (skipped) "
+                f"ray={ray_time:.3f}s total={total_time:.3f}s",
+                flush=True
+            )
+    else:
+        # Other ranks don't need to do anything, just wait for barrier
+        if _is_baseline_profile_enabled():
+            # Still print for consistency in logs
+            print(
+                f"[Baseline Profile] rank={rank} gather_src={ipc_gather_src} (non-src rank, skipped)",
+                flush=True
+            )
+
+    # Synchronization point: ensure send completes before continuing
+    dist.barrier(group=ipc_gather_group)
 
     return refs, long_live_tensors
