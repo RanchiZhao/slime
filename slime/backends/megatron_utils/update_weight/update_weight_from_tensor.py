@@ -1,4 +1,3 @@
-import io
 import logging
 import os
 import time
@@ -6,7 +5,6 @@ from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-import pybase64
 import ray
 import torch
 import torch.distributed as dist
@@ -203,17 +201,14 @@ class UpdateWeightFromTensor:
     def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
         """Serialize a chunk of HF tensors to string.
 
-        Use torch.save instead of ForkingPickler to support cross-node transfer.
-        ForkingPickler uses fd sharing which only works within the same machine.
+        Keep tensors on CUDA and use ForkingPickler (fast).
+        SGLang's patch_torch handles UUID mismatch for cross-node deserialization.
         """
-        # Move tensors to CPU to avoid device UUID issues in cross-node deserialization
-        cpu_named_tensors = [(name, tensor.cpu()) for name, tensor in hf_named_tensors]
-
         if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            converted_named_tensors_by_dtypes = {"dtype": cpu_named_tensors}
+            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
         else:
             converted_named_tensors_by_dtypes = {}
-            for name, tensor in cpu_named_tensors:
+            for name, tensor in hf_named_tensors:
                 dtype = tensor.dtype
                 if dtype not in converted_named_tensors_by_dtypes:
                     converted_named_tensors_by_dtypes[dtype] = []
@@ -225,19 +220,12 @@ class UpdateWeightFromTensor:
             metadata = flattened_tensor_bucket.get_metadata()
             flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
 
-            # Ensure flattened tensor is on CPU before serialization
-            if flattened_tensor.is_cuda:
-                flattened_tensor = flattened_tensor.cpu()
-
             flattened_tensor_data = {
                 "flattened_tensor": flattened_tensor,
                 "metadata": metadata,
             }
-            # Use torch.save instead of ForkingPickler for cross-node compatibility
-            # Prefix with "TORCH:" to indicate the format for deserialization
-            buffer = io.BytesIO()
-            torch.save(flattened_tensor_data, buffer)
-            return "TORCH:" + pybase64.b64encode(buffer.getvalue()).decode("utf-8")
+            # Use ForkingPickler (fast) - SGLang handles UUID mismatch
+            return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
