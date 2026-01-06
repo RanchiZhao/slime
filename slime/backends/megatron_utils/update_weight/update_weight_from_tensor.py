@@ -157,9 +157,9 @@ class UpdateWeightFromTensor:
             t_chunks_start = time.time()
 
         # === SLIDING WINDOW MODE ===
-        # Window size: balance between parallelism and memory/sync overhead
-        # 16 chunks × 504MB = ~8GB max memory per window (safe for 128-GPU cluster)
-        window_size = 16
+        # Start with window_size=1 to verify correctness (sync every chunk)
+        # Once verified, increase to 16/32 for better throughput
+        window_size = 1
         pending_refs = []
         pending_tensors = []
 
