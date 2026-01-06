@@ -117,11 +117,20 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
 
-        CRITICAL: Use async mode to avoid NCCL deadlock.
-        - All NCCL ops (PP/EP/TP) in get_hf_weight_chunks() involve 128 ranks globally
-        - Ray sends are non-blocking, only gather_src ranks (0, 64) send
-        - We collect all refs during the loop, then wait at the end after all NCCL ops complete
-        - This ensures 128 ranks stay synchronized for NCCL, while Ray IO is deferred
+        Use SLIDING WINDOW mode to balance throughput and stability:
+        - Process chunks in windows of size N
+        - At end of each window: ray.get + barrier to sync all 128 ranks
+        - This prevents NCCL drift while maintaining pipeline parallelism
+
+        Why not fully async?
+        - Ray remote() blocks during kwarg serialization (~1s for 504MB)
+        - gather_src ranks (0, 64) serialize, others don't
+        - This causes rank drift → NCCL ops desync → timeout
+
+        Why not per-chunk sync (like original baseline)?
+        - Original used gather_object as implicit sync point
+        - We removed gather_object, so need explicit sync
+        - Per-chunk sync is too slow, window mode is the balance
         """
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -147,30 +156,39 @@ class UpdateWeightFromTensor:
             weights_getter_time = time.time() - t_weights_getter_start
             t_chunks_start = time.time()
 
-        # === ASYNC MODE: Collect all refs, wait at the end ===
-        # This ensures all 128 ranks complete NCCL ops before any rank blocks on ray.get
-        all_refs = []
-        all_long_lived_tensors = []
+        # === SLIDING WINDOW MODE ===
+        # Window size: balance between parallelism and memory/sync overhead
+        # 16 chunks × 504MB = ~8GB max memory per window (safe for 128-GPU cluster)
+        window_size = 16
+        pending_refs = []
+        pending_tensors = []
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            all_refs.extend(refs)
-            all_long_lived_tensors.append(long_lived_tensors)  # Keep refs alive until ray.get
+            pending_refs.extend(refs)
+            pending_tensors.append(long_lived_tensors)
             chunk_count += 1
+
+            # Window full: sync all ranks and wait for Ray
+            if chunk_count % window_size == 0:
+                # 1. Global barrier: ensure all 128 ranks complete NCCL before blocking IO
+                dist.barrier(group=get_gloo_group())
+                # 2. Wait for Ray: only gather_src ranks have refs, others have empty list
+                ray.get(pending_refs)
+                # 3. Clear memory
+                pending_refs = []
+                pending_tensors = []
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
             t_rayget_start = time.time()
 
-        # All NCCL ops complete, global sync before blocking IO
+        # Final window: handle remaining chunks
         dist.barrier(group=get_gloo_group())
-
-        # Now safe to wait - only gather_src ranks have refs, others have empty list
-        ray.get(all_refs)
-
-        # Release tensors after ray.get completes
-        del all_long_lived_tensors
+        if pending_refs:
+            ray.get(pending_refs)
+        del pending_tensors
 
         if _is_baseline_profile_enabled():
             rayget_time = time.time() - t_rayget_start
