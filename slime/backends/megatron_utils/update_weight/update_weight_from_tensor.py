@@ -25,9 +25,15 @@ def _debug_log(msg: str, rank: int = -1):
     if rank != 0:
         return
     try:
-        with open("/tmp/weight_sync_debug.log", "a") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-            f.flush()
+        import socket
+        hostname = socket.gethostname()
+        # 同时写到固定路径和带hostname的路径
+        for path in ["/tmp/weight_sync_debug.log", f"/tmp/weight_sync_rank0_{hostname}.log"]:
+            with open(path, "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                f.flush()
+        # 也打印到 stdout，带明显标记
+        print(f"[RANK0-DEBUG] {msg}", flush=True)
     except Exception:
         pass  # Silent fail if can't write
 
