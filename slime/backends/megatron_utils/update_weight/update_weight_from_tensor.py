@@ -133,9 +133,9 @@ class UpdateWeightFromTensor:
             t_flush_start = time.time()
 
         if rank == 0:
-            print(f"[DEBUG] rank=0 flush_cache: num_engines={len(self.rollout_engines)}", flush=True)
+            logger.warning(f"[WEIGHT-SYNC] rank=0 flush_cache: num_engines={len(self.rollout_engines)}")
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            print(f"[DEBUG] rank=0 flush_cache: DONE", flush=True)
+            logger.warning(f"[WEIGHT-SYNC] rank=0 flush_cache: DONE")
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
@@ -154,7 +154,7 @@ class UpdateWeightFromTensor:
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             if rank in debug_ranks and chunk_count < 3:
-                print(f"[DEBUG] rank={rank} chunk={chunk_count}: got tensors, n={len(hf_named_tensors)}", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count}: got tensors, n={len(hf_named_tensors)}")
 
             # All ranks serialize (for CUDA sync)
             t_serialize = time.time()
@@ -162,14 +162,14 @@ class UpdateWeightFromTensor:
             serialize_time = time.time() - t_serialize
 
             if rank in debug_ranks and chunk_count < 3:
-                print(f"[DEBUG] rank={rank} chunk={chunk_count}: serialized in {serialize_time:.3f}s", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count}: serialized in {serialize_time:.3f}s")
 
             # Only rank 0 sends to ALL engines
             refs = []
             if rank == 0:
                 for i, engine in enumerate(self.rollout_engines):
                     t_remote = time.time()
-                    print(f"[DEBUG] rank=0 chunk={chunk_count}: sending to engine {i}...", flush=True)
+                    logger.warning(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sending to engine {i}...")
                     ref = engine.update_weights_from_tensor.remote(
                         serialized_named_tensors=[serialized],
                         load_format="flattened_bucket",
@@ -177,23 +177,23 @@ class UpdateWeightFromTensor:
                     )
                     refs.append(ref)
                     remote_time = time.time() - t_remote
-                    print(f"[DEBUG] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s", flush=True)
+                    logger.warning(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s")
 
             chunk_count += 1
 
             # rank 0 waits for Ray, then ALL ranks sync before next chunk
             if rank == 0:
-                print(f"[DEBUG] rank=0 chunk={chunk_count-1}: calling ray.get on {len(refs)} refs...", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count-1}: calling ray.get on {len(refs)} refs...")
                 t_rayget = time.time()
                 ray.get(refs)
                 rayget_time = time.time() - t_rayget
-                print(f"[DEBUG] rank=0 chunk={chunk_count-1}: ray.get done in {rayget_time:.3f}s", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count-1}: ray.get done in {rayget_time:.3f}s")
 
             if rank in debug_ranks and chunk_count <= 3:
-                print(f"[DEBUG] rank={rank} chunk={chunk_count-1}: entering barrier...", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count-1}: entering barrier...")
             dist.barrier(group=get_gloo_group())  # Sync AFTER ray.get!
             if rank in debug_ranks and chunk_count <= 3:
-                print(f"[DEBUG] rank={rank} chunk={chunk_count-1}: barrier done", flush=True)
+                logger.warning(f"[WEIGHT-SYNC] rank={rank} chunk={chunk_count-1}: barrier done")
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
