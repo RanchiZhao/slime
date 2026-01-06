@@ -135,6 +135,11 @@ class UpdateWeightFromTensor:
 
         SIMPLIFIED DESIGN: Only rank 0 sends to ALL engines.
         """
+        # 无条件写文件，看这个方法到底有没有被调用
+        with open("/mnt/hisys-data/yqzhao/update_weights_called.log", "a") as f:
+            f.write(f"update_weights called! dist.get_rank()={dist.get_rank()}\n")
+            f.flush()
+
         rank = dist.get_rank()
 
         # 写到共享存储，一定能看到
