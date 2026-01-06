@@ -133,20 +133,12 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
 
-        SIMPLIFIED DESIGN: Only rank 0 sends to ALL engines.
+        OPTIMIZED: Each gather_src sends to its own colocated engine (no cross-node).
+        Skip redundant Gloo gather - just send 1 copy instead of 64 identical copies.
+        - Rank 0 (gather_src for engine 0) → Engine 0
+        - Rank 64 (gather_src for engine 1) → Engine 1
         """
-        # 无条件写文件，看这个方法到底有没有被调用
-        with open("/mnt/hisys-data/yqzhao/update_weights_called.log", "a") as f:
-            f.write(f"update_weights called! dist.get_rank()={dist.get_rank()}\n")
-            f.flush()
-
         rank = dist.get_rank()
-
-        # 写到共享存储，一定能看到
-        if rank == 0:
-            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                f.write(f"ENTERING update_weights, num_engines={len(self.rollout_engines)}\n")
-                f.flush()
 
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -156,14 +148,9 @@ class UpdateWeightFromTensor:
         if _is_baseline_profile_enabled():
             t_flush_start = time.time()
 
+        # Only rank 0 flushes cache (same as baseline)
         if rank == 0:
-            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                f.write(f"calling flush_cache on {len(self.rollout_engines)} engines\n")
-                f.flush()
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                f.write("flush_cache DONE\n")
-                f.flush()
         dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
@@ -178,44 +165,25 @@ class UpdateWeightFromTensor:
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            # All ranks serialize (for CUDA sync)
+            # All ranks serialize (needed for CUDA sync)
             serialized = self._serialize_chunk(hf_named_tensors)
 
-            # Only rank 0 sends to ALL engines
+            # Only gather_src ranks send to their colocated engine
+            # This avoids cross-node serialization issues (device UUID mismatch)
             refs = []
-            if rank == 0:
-                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                    f.write(f"chunk={chunk_count} sending to {len(self.rollout_engines)} engines\n")
-                    f.flush()
-                for i, engine in enumerate(self.rollout_engines):
-                    with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                        f.write(f"chunk={chunk_count} engine={i} calling remote()...\n")
-                        f.flush()
-                    ref = engine.update_weights_from_tensor.remote(
-                        serialized_named_tensors=[serialized],
-                        load_format="flattened_bucket",
-                        weight_version=str(self.weight_version),
-                    )
-                    refs.append(ref)
-                    with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                        f.write(f"chunk={chunk_count} engine={i} remote() returned\n")
-                        f.flush()
-                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                    f.write(f"chunk={chunk_count} all {len(refs)} refs collected, calling ray.get\n")
-                    f.flush()
+            if rank == self._ipc_gather_src:
+                ref = self._ipc_engine.update_weights_from_tensor.remote(
+                    serialized_named_tensors=[serialized],
+                    load_format="flattened_bucket",
+                    weight_version=str(self.weight_version),
+                )
+                refs.append(ref)
 
             chunk_count += 1
 
-            # rank 0 waits for Ray, then ALL ranks sync before next chunk
-            if rank == 0 and refs:
-                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                    f.write(f"chunk={chunk_count-1} ray.get on {len(refs)} refs...\n")
-                    f.flush()
+            # gather_src waits for its engine, then all ranks barrier
+            if refs:
                 ray.get(refs)
-                with open("/mnt/hisys-data/yqzhao/rank0_debug.log", "a") as f:
-                    f.write(f"chunk={chunk_count-1} ray.get DONE\n")
-                    f.flush()
-
             dist.barrier(group=get_gloo_group())
 
         if _is_baseline_profile_enabled():
