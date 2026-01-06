@@ -262,12 +262,13 @@ def _send_to_colocated_engine(
         serialize_time = time.time() - t_start
         t_send_start = time.time()
 
-    # DEBUG: Print before sending
-    print(f"[DEBUG] rank={rank} ipc_gather_src={ipc_gather_src} will_send={rank == ipc_gather_src}", flush=True)
+    # DEBUG: Always print for gather_src ranks (rank 0 and 64)
+    if rank == ipc_gather_src:
+        print(f"[GATHER_SRC] rank={rank} ipc_gather_src={ipc_gather_src} serialized={len(serialized_tensors)} tensors", flush=True)
 
     # Only gather_src rank sends (skip the redundant Gloo gather)
     if rank == ipc_gather_src:
-        print(f"[DEBUG] rank={rank} starting to send {len(serialized_tensors)} requests to engine", flush=True)
+        print(f"[GATHER_SRC] rank={rank} SENDING {len(serialized_tensors)} requests to engine...", flush=True)
         for i in range(len(serialized_tensors)):
             kwargs = {
                 "serialized_named_tensors": [serialized_tensors[i]],  # Single copy, wrapped in list
@@ -275,7 +276,7 @@ def _send_to_colocated_engine(
                 "weight_version": str(weight_version),
             }
             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))
-        print(f"[DEBUG] rank={rank} sent {len(refs)} requests", flush=True)
+        print(f"[GATHER_SRC] rank={rank} SENT {len(refs)} requests successfully", flush=True)
 
     if _is_baseline_profile_enabled():
         send_time = time.time() - t_send_start
