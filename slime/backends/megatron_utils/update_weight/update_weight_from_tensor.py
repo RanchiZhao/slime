@@ -117,20 +117,10 @@ class UpdateWeightFromTensor:
         """
         version++, flush caches, process buckets. Progress on rank 0.
 
-        Use SLIDING WINDOW mode to balance throughput and stability:
-        - Process chunks in windows of size N
-        - At end of each window: ray.get + barrier to sync all 128 ranks
-        - This prevents NCCL drift while maintaining pipeline parallelism
-
-        Why not fully async?
-        - Ray remote() blocks during kwarg serialization (~1s for 504MB)
-        - gather_src ranks (0, 64) serialize, others don't
-        - This causes rank drift → NCCL ops desync → timeout
-
-        Why not per-chunk sync (like original baseline)?
-        - Original used gather_object as implicit sync point
-        - We removed gather_object, so need explicit sync
-        - Per-chunk sync is too slow, window mode is the balance
+        SIMPLIFIED DESIGN: Only rank 0 sends to ALL engines.
+        - Avoids the mystery of why rank 64 doesn't send to engine 1
+        - rank 0 already has handles to all engines (see flush_cache)
+        - All other ranks only do NCCL communication and serialization
         """
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -156,51 +146,62 @@ class UpdateWeightFromTensor:
             weights_getter_time = time.time() - t_weights_getter_start
             t_chunks_start = time.time()
 
-        # === SLIDING WINDOW MODE ===
-        # Start with window_size=1 to verify correctness (sync every chunk)
-        # Once verified, increase to 16/32 for better throughput
-        window_size = 1
-        pending_refs = []
-        pending_tensors = []
-
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            pending_refs.extend(refs)
-            pending_tensors.append(long_lived_tensors)
+            # All ranks serialize (for CUDA sync)
+            serialized = self._serialize_chunk(hf_named_tensors)
+
+            # Only rank 0 sends to ALL engines
+            refs = []
+            if rank == 0:
+                for engine in self.rollout_engines:
+                    refs.append(engine.update_weights_from_tensor.remote(
+                        serialized_named_tensors=[serialized],
+                        load_format="flattened_bucket",
+                        weight_version=str(self.weight_version),
+                    ))
+
             chunk_count += 1
 
-            # Window full: sync all ranks and wait for Ray
-            if chunk_count % window_size == 0:
-                # 1. Global barrier: ensure all 128 ranks complete NCCL before blocking IO
-                dist.barrier(group=get_gloo_group())
-                # 2. Wait for Ray: only gather_src ranks have refs, others have empty list
-                ray.get(pending_refs)
-                # 3. Clear memory
-                pending_refs = []
-                pending_tensors = []
+            # Sync all ranks and wait for Ray
+            dist.barrier(group=get_gloo_group())
+            if refs:
+                ray.get(refs)
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
-            t_rayget_start = time.time()
-
-        # Final window: handle remaining chunks
-        dist.barrier(group=get_gloo_group())
-        if pending_refs:
-            ray.get(pending_refs)
-        del pending_tensors
-
-        if _is_baseline_profile_enabled():
-            rayget_time = time.time() - t_rayget_start
             total_time = time.time() - t_cycle_start
             print(
                 f"[Baseline Profile] Cycle complete: rank={rank} version={self.weight_version} "
                 f"chunks={chunk_count} flush={flush_time:.3f}s weights_getter={weights_getter_time:.3f}s "
-                f"chunks_loop={chunks_time:.3f}s rayget={rayget_time:.3f}s total={total_time:.3f}s",
+                f"chunks_loop={chunks_time:.3f}s total={total_time:.3f}s",
                 flush=True
             )
 
         dist.barrier(group=get_gloo_group())
+
+    def _serialize_chunk(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> str:
+        """Serialize a chunk of HF tensors to string."""
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+        else:
+            converted_named_tensors_by_dtypes = {}
+            for name, tensor in hf_named_tensors:
+                dtype = tensor.dtype
+                if dtype not in converted_named_tensors_by_dtypes:
+                    converted_named_tensors_by_dtypes[dtype] = []
+                converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+
+        # Usually only one dtype (bf16), so one serialized string
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            metadata = flattened_tensor_bucket.get_metadata()
+            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor,
+                "metadata": metadata,
+            }
+            return MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
