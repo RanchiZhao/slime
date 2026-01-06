@@ -129,6 +129,11 @@ class UpdateWeightFromTensor:
         rank = dist.get_rank()
         logger.info(f"[WEIGHT-SYNC] *** ENTERING update_weights *** rank={rank} version={self.weight_version + 1}")
 
+        # Write to stderr for rank 0 to ensure visibility
+        if rank == 0:
+            import sys
+            print(f"[WEIGHT-SYNC-STDERR] rank=0 entering update_weights, num_engines={len(self.rollout_engines)}", file=sys.stderr, flush=True)
+
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
 
@@ -172,8 +177,11 @@ class UpdateWeightFromTensor:
             # Only rank 0 sends to ALL engines
             refs = []
             if rank == 0:
+                import sys
+                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: about to send to {len(self.rollout_engines)} engines", file=sys.stderr, flush=True)
                 for i, engine in enumerate(self.rollout_engines):
                     t_remote = time.time()
+                    print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sending to engine {i}...", file=sys.stderr, flush=True)
                     logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sending to engine {i}...")
                     ref = engine.update_weights_from_tensor.remote(
                         serialized_named_tensors=[serialized],
@@ -182,7 +190,9 @@ class UpdateWeightFromTensor:
                     )
                     refs.append(ref)
                     remote_time = time.time() - t_remote
+                    print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s", file=sys.stderr, flush=True)
                     logger.info(f"[WEIGHT-SYNC] rank=0 chunk={chunk_count}: sent to engine {i} in {remote_time:.3f}s")
+                print(f"[WEIGHT-SYNC-STDERR] rank=0 chunk={chunk_count}: all engines sent, calling ray.get", file=sys.stderr, flush=True)
 
             chunk_count += 1
 
