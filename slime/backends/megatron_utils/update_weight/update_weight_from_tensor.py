@@ -163,10 +163,10 @@ class UpdateWeightFromTensor:
 
             chunk_count += 1
 
-            # Sync all ranks and wait for Ray
-            dist.barrier(group=get_gloo_group())
-            if refs:
+            # rank 0 waits for Ray, then ALL ranks sync before next chunk
+            if rank == 0:
                 ray.get(refs)
+            dist.barrier(group=get_gloo_group())  # Sync AFTER ray.get!
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
