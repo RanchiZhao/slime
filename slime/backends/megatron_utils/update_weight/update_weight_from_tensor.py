@@ -260,11 +260,19 @@ def _send_to_colocated_engine(
             if rank == 0:
                 tensor_mb = tensor_bytes / (1024 * 1024)
                 serialized_mb = len(serialized) / (1024 * 1024)
-                print(
+                log_msg = (
                     f"[Serialize Analysis] tensor_mb={tensor_mb:.1f} serialized_mb={serialized_mb:.1f} "
-                    f"ratio={serialized_mb/tensor_mb:.4f}x device={flattened_tensor.device}",
-                    flush=True
+                    f"ratio={serialized_mb/tensor_mb:.4f}x device={flattened_tensor.device}"
                 )
+                print(log_msg, flush=True)
+                # Write to shared storage for reliability
+                try:
+                    with open("/mnt/hisys-data/yqzhao/slime_profile.log", "a") as f:
+                        f.write(log_msg + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
 
     if _is_baseline_profile_enabled():
         serialize_time = time.time() - t_start
@@ -305,12 +313,19 @@ def _send_to_colocated_engine(
         total_gathered_mb = (total_bytes * world_size) / (1024 * 1024)
         gather_throughput = total_gathered_mb / gather_time if gather_time > 0 else 0
         if rank == ipc_gather_src:
-            print(
+            log_msg = (
                 f"[Baseline Profile] rank={rank} n_tensors={len(hf_named_tensors)} "
                 f"data_mb={total_gathered_mb:.1f} "
                 f"serialize={serialize_time:.3f}s gather={gather_time:.3f}s "
-                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s",
-                flush=True
+                f"({gather_throughput:.1f}MB/s) ray={ray_time:.3f}s total={total_time:.3f}s"
             )
+            print(log_msg, flush=True)
+            try:
+                with open("/mnt/hisys-data/yqzhao/slime_profile.log", "a") as f:
+                    f.write(log_msg + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
 
     return refs, long_live_tensors
