@@ -116,6 +116,12 @@ class UpdateWeightFromTensor:
     def update_weights(self) -> None:
         """
         version++, flush caches, process buckets. Progress on rank 0.
+
+        CRITICAL: Use async mode to avoid NCCL deadlock.
+        - All NCCL ops (PP/EP/TP) in get_hf_weight_chunks() involve 128 ranks globally
+        - Ray sends are non-blocking, only gather_src ranks (0, 64) send
+        - We collect all refs during the loop, then wait at the end after all NCCL ops complete
+        - This ensures 128 ranks stay synchronized for NCCL, while Ray IO is deferred
         """
         if _is_baseline_profile_enabled():
             t_cycle_start = time.time()
@@ -140,47 +146,39 @@ class UpdateWeightFromTensor:
         if _is_baseline_profile_enabled():
             weights_getter_time = time.time() - t_weights_getter_start
             t_chunks_start = time.time()
-            total_rayget_time = 0.0
-            total_send_time = 0.0
+
+        # === ASYNC MODE: Collect all refs, wait at the end ===
+        # This ensures all 128 ranks complete NCCL ops before any rank blocks on ray.get
+        all_refs = []
+        all_long_lived_tensors = []
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            if _is_baseline_profile_enabled():
-                t_send_start = time.time()
-
             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-
-            if _is_baseline_profile_enabled():
-                send_time = time.time() - t_send_start
-                total_send_time += send_time
-                t_rayget_start = time.time()
-
-            ray.get(refs)
-
-            # CRITICAL: Sync all ranks after ray.get to prevent deadlock
-            # Without this barrier:
-            # - non-gather_src ranks have empty refs, ray.get([]) returns immediately
-            # - gather_src ranks wait for SGLang to complete
-            # - non-gather_src ranks proceed to next chunk and hit barrier in _send_to_colocated_engine
-            # - gather_src ranks are still waiting on ray.get → DEADLOCK
-            dist.barrier(group=self._ipc_gather_group)
-
-            if _is_baseline_profile_enabled():
-                rayget_time = time.time() - t_rayget_start
-                total_rayget_time += rayget_time
-
-            del long_lived_tensors
+            all_refs.extend(refs)
+            all_long_lived_tensors.append(long_lived_tensors)  # Keep refs alive until ray.get
             chunk_count += 1
 
         if _is_baseline_profile_enabled():
             chunks_time = time.time() - t_chunks_start
+            t_rayget_start = time.time()
+
+        # All NCCL ops complete, global sync before blocking IO
+        dist.barrier(group=get_gloo_group())
+
+        # Now safe to wait - only gather_src ranks have refs, others have empty list
+        ray.get(all_refs)
+
+        # Release tensors after ray.get completes
+        del all_long_lived_tensors
+
+        if _is_baseline_profile_enabled():
+            rayget_time = time.time() - t_rayget_start
             total_time = time.time() - t_cycle_start
-            # 从所有 rank 打印总结信息（只打印一次，Ray 会聚合）
             print(
                 f"[Baseline Profile] Cycle complete: rank={rank} version={self.weight_version} "
                 f"chunks={chunk_count} flush={flush_time:.3f}s weights_getter={weights_getter_time:.3f}s "
-                f"total_send={total_send_time:.3f}s total_rayget={total_rayget_time:.3f}s "
-                f"chunks_loop={chunks_time:.3f}s total={total_time:.3f}s",
+                f"chunks_loop={chunks_time:.3f}s rayget={rayget_time:.3f}s total={total_time:.3f}s",
                 flush=True
             )
 
@@ -293,7 +291,5 @@ def _send_to_colocated_engine(
                 flush=True
             )
 
-    # Synchronization point: ensure all ranks finish before continuing
-    dist.barrier(group=ipc_gather_group)
-
+    # No barrier here - async mode handles sync at the end of update_weights()
     return refs, long_live_tensors
