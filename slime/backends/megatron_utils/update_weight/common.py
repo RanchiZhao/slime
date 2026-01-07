@@ -66,6 +66,10 @@ def all_gather_params_async(
     deep_profile = _is_deep_profile_enabled()
     rank = dist.get_rank()
 
+    # Deep profile: only sample first N tensors to avoid performance impact
+    DEEP_PROFILE_SAMPLE_COUNT = 5
+    deep_profile_timings = []
+
     # Phase 1: Start all async all_gather operations
     gather_tasks = []
     handles = []
@@ -89,21 +93,15 @@ def all_gather_params_async(
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
 
-            if deep_profile:
-                # Per-tensor timing for deep profiling
+            # Deep profile: only time first N tensors (sample, don't block all)
+            if deep_profile and idx < DEEP_PROFILE_SAMPLE_COUNT:
                 t0 = time.time()
                 handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-                handle.wait()
+                handle.wait()  # Only wait for sampled tensors
                 elapsed = time.time() - t0
                 size_mb = param.data.numel() * param.data.element_size() / 1e6
                 throughput_gbs = (size_mb * tp_size) / elapsed / 1000 if elapsed > 0 else 0
-                if rank == 0 and idx < 10:  # Only log first 10 params from rank 0
-                    print(
-                        f"[NCCL Deep] #{idx} {info.name[:40]:40s} "
-                        f"size={size_mb:.1f}MB time={elapsed*1000:.2f}ms "
-                        f"throughput={throughput_gbs:.1f}GB/s",
-                        flush=True
-                    )
+                deep_profile_timings.append((idx, info.name[:40], size_mb, elapsed, throughput_gbs))
                 gather_tasks.append((info, None, None, param_partitions, param.partition_dim))
                 handles.append(None)  # Already waited
             else:
@@ -111,12 +109,21 @@ def all_gather_params_async(
                 gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
                 handles.append(handle)
 
-    # Phase 2: Wait for ALL async operations to complete at once (if not deep profiling)
+    # Phase 2: Wait for ALL async operations to complete at once
     # This ensures maximum parallelism by not blocking on individual operations
-    if not deep_profile:
-        for handle in handles:
-            if handle is not None:
-                handle.wait()
+    for handle in handles:
+        if handle is not None:
+            handle.wait()
+
+    # Deep profile: print sampled timings after all operations complete
+    if deep_profile and rank == 0 and deep_profile_timings:
+        for idx, name, size_mb, elapsed, throughput_gbs in deep_profile_timings:
+            print(
+                f"[NCCL Deep] #{idx} {name:40s} "
+                f"size={size_mb:.1f}MB time={elapsed*1000:.2f}ms "
+                f"throughput={throughput_gbs:.1f}GB/s",
+                flush=True
+            )
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
