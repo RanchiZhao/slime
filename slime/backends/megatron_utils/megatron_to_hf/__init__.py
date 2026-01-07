@@ -1,3 +1,6 @@
+import os
+import time
+
 from .deepseekv3 import convert_deepseekv3_to_hf
 from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
@@ -10,6 +13,36 @@ from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
 
 
+def _is_hf_convert_profile_enabled():
+    """Check at runtime for HF convert profiling."""
+    return os.environ.get("SLIME_HF_CONVERT_PROFILE", "0") == "1"
+
+
+# Global accumulators for HF convert profiling (per chunk)
+_hf_convert_profile = {
+    "remove_padding_time": 0.0,
+    "convert_core_time": 0.0,
+    "quantize_time": 0.0,
+    "param_count": 0,
+}
+
+
+def reset_hf_convert_profile():
+    """Reset the profiling accumulators. Call at the start of each chunk."""
+    global _hf_convert_profile
+    _hf_convert_profile = {
+        "remove_padding_time": 0.0,
+        "convert_core_time": 0.0,
+        "quantize_time": 0.0,
+        "param_count": 0,
+    }
+
+
+def get_hf_convert_profile():
+    """Get the current profiling data."""
+    return _hf_convert_profile.copy()
+
+
 # TODO unify w/ `convert_to_hf`
 def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
     param = remove_padding(megatron_param_name, param, args.vocab_size)
@@ -19,14 +52,35 @@ def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
 
 # TODO optimize code details
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
+    global _hf_convert_profile
+    profile_enabled = _is_hf_convert_profile_enabled()
+
+    if profile_enabled:
+        t0 = time.time()
+
     param = remove_padding(name, param, args.vocab_size)
 
+    if profile_enabled:
+        t1 = time.time()
+        _hf_convert_profile["remove_padding_time"] += t1 - t0
+
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
+
+    if profile_enabled:
+        t2 = time.time()
+        _hf_convert_profile["convert_core_time"] += t2 - t1
+        _hf_convert_profile["param_count"] += 1
 
     if not quantization_config:
         return converted_named_tensors
 
-    return quantize_params(args, name, converted_named_tensors, quantization_config)
+    result = quantize_params(args, name, converted_named_tensors, quantization_config)
+
+    if profile_enabled:
+        t3 = time.time()
+        _hf_convert_profile["quantize_time"] += t3 - t2
+
+    return result
 
 
 # TODO optimize

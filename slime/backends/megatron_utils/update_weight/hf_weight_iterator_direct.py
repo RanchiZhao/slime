@@ -12,7 +12,7 @@ from tqdm import tqdm
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
 
-from ..megatron_to_hf import convert_to_hf
+from ..megatron_to_hf import convert_to_hf, get_hf_convert_profile, reset_hf_convert_profile
 from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
@@ -28,6 +28,11 @@ def _is_deep_profile_enabled():
     return os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
 
 
+def _is_hf_convert_profile_enabled():
+    """Check at runtime for HF convert profiling."""
+    return os.environ.get("SLIME_HF_CONVERT_PROFILE", "0") == "1"
+
+
 class HfWeightIteratorDirect(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -35,10 +40,19 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         rank = dist.get_rank()
+        hf_convert_profile_enabled = _is_hf_convert_profile_enabled()
 
         if _is_baseline_profile_enabled():
             total_nccl_time = 0.0
             total_hf_convert_time = 0.0
+
+        # Accumulators for HF convert detailed profiling (cycle-level)
+        if hf_convert_profile_enabled:
+            cycle_remove_padding = 0.0
+            cycle_convert_core = 0.0
+            cycle_quantize = 0.0
+            cycle_param_count = 0
+            chunk_idx = 0
 
         for megatron_local_param_infos in tqdm(
             self.megatron_local_param_info_buckets, disable=rank != 0, desc="Update weights"
@@ -53,11 +67,35 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
                 total_nccl_time += nccl_time
                 t_hf_start = time.time()
 
+            # Reset per-chunk profiling before HF convert
+            if hf_convert_profile_enabled:
+                reset_hf_convert_profile()
+
             hf_named_tensors = self._convert_to_hf_named_tensors(megatron_full_params, megatron_local_param_infos)
 
             if _is_baseline_profile_enabled():
                 hf_convert_time = time.time() - t_hf_start
                 total_hf_convert_time += hf_convert_time
+
+            # Collect and log per-chunk HF convert profile (sample first 5 chunks from rank 0)
+            if hf_convert_profile_enabled:
+                profile = get_hf_convert_profile()
+                cycle_remove_padding += profile["remove_padding_time"]
+                cycle_convert_core += profile["convert_core_time"]
+                cycle_quantize += profile["quantize_time"]
+                cycle_param_count += profile["param_count"]
+
+                # Log first 5 chunks for per-chunk detail
+                if rank == 0 and chunk_idx < 5:
+                    print(
+                        f"[HF Convert Profile] chunk={chunk_idx} params={profile['param_count']} "
+                        f"remove_padding={profile['remove_padding_time']*1000:.2f}ms "
+                        f"convert_core={profile['convert_core_time']*1000:.2f}ms "
+                        f"quantize={profile['quantize_time']*1000:.2f}ms "
+                        f"total={hf_convert_time*1000:.2f}ms",
+                        flush=True
+                    )
+                chunk_idx += 1
 
             yield hf_named_tensors
             del megatron_full_params
@@ -66,6 +104,18 @@ class HfWeightIteratorDirect(HfWeightIteratorBase):
             # 从所有 rank 打印总结信息（只打印一次，Ray 会聚合）
             print(
                 f"[HF Iterator Profile] rank={rank} total_nccl={total_nccl_time:.3f}s total_hf_convert={total_hf_convert_time:.3f}s",
+                flush=True
+            )
+
+        # Print cycle-level HF convert summary
+        if hf_convert_profile_enabled and rank == 0:
+            total_time = cycle_remove_padding + cycle_convert_core + cycle_quantize
+            print(
+                f"[HF Convert Cycle Summary] params={cycle_param_count} chunks={chunk_idx} "
+                f"remove_padding={cycle_remove_padding:.3f}s ({cycle_remove_padding/total_time*100:.1f}%) "
+                f"convert_core={cycle_convert_core:.3f}s ({cycle_convert_core/total_time*100:.1f}%) "
+                f"quantize={cycle_quantize:.3f}s ({cycle_quantize/total_time*100:.1f}%) "
+                f"total={total_time:.3f}s",
                 flush=True
             )
 
