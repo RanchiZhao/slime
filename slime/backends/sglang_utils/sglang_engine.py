@@ -226,6 +226,7 @@ class SGLangEngine(RayActor):
         load_format: str | None = None,
         flush_cache: bool = False,
         weight_version: str | None = None,
+        _submit_ts: float | None = None,
     ):
         """
         Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
@@ -240,6 +241,8 @@ class SGLangEngine(RayActor):
         }
         if weight_version is not None:
             payload["weight_version"] = weight_version
+        if _submit_ts is not None:
+            payload["_submit_ts"] = _submit_ts
         return self._make_request(
             "update_weights_from_tensor",
             payload,
