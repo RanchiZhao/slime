@@ -176,6 +176,15 @@ class UpdateWeightFromTensor:
             quantization_config=self.quantization_config,
         )
 
+        # Initialize Gloo groups for gather (needed by _send_hf_params)
+        for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
+            end_rank = start_rank + self.args.rollout_num_gpus_per_engine
+            group_ranks = list(range(start_rank, end_rank))
+            new_group = dist.new_group(ranks=group_ranks, backend="gloo")
+            if dist.get_rank() in group_ranks:
+                self._ipc_gather_group = new_group
+                self._ipc_gather_src = start_rank
+
         # Initialize MetaServer client
         meta_server_addr = getattr(args, "awex_meta_server_addr", None)
         if not meta_server_addr:
