@@ -47,17 +47,20 @@ def _is_metaserver_p2p_enabled(args):
 
 
 def _get_gpu_identity():
-    """Get unique GPU identity: hostname_deviceid."""
+    """Get unique GPU identity using GPU UUID (physical device identifier)."""
     import socket
     hostname = socket.gethostname()
     device_id = torch.cuda.current_device()
+    # Use GPU UUID for reliable physical device matching across processes
+    gpu_uuid = str(torch.cuda.get_device_properties(device_id).uuid)
+
     # DEBUG: Log for troubleshooting IPC issues
     rank = dist.get_rank() if dist.is_initialized() else 0
     logger.info(
         f"[MetaServer P2P DEBUG] Slime rank={rank}, hostname={hostname}, "
-        f"cuda.current_device()={device_id}, identity={hostname}_{device_id}"
+        f"device_id={device_id}, gpu_uuid={gpu_uuid}"
     )
-    return f"{hostname}_{device_id}"
+    return gpu_uuid  # Use UUID instead of hostname_deviceid
 
 
 class UpdateWeightFromTensor:
