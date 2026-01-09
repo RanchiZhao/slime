@@ -463,6 +463,12 @@ class UpdateWeightFromTensor:
             if profile_enabled:
                 ms_put_time = time.time() - t_ms_put_start
                 total_ms_put_time += ms_put_time
+
+            # CRITICAL: Barrier to ensure ALL ranks have PUT before triggering SGLang
+            # Without this, gather_src might send Ray trigger while other ranks are still PUT-ing
+            dist.barrier(group=get_gloo_group())
+
+            if profile_enabled:
                 t_ray_start = time.time()
 
             # 4. Only gather_src rank sends Ray triggers to ALL engines
