@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import ray
+import requests
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -187,12 +188,32 @@ class UpdateWeightFromTensor:
         else:
             raise ValueError(f"Invalid meta_server_addr format: {meta_server_addr}, expected 'ip:port'")
 
-        # Import and create MetaServer client
-        import sys
-        sys.path.insert(0, "/mnt/hisys-data/yqzhao/asystem-awex")
-        from awex.meta.meta_server import MetaServerClient
+        # Inline lightweight MetaServer client (avoid external dependency)
+        import pickle
+        import struct
 
-        self._ms_client = MetaServerClient(host, port)
+        class LightweightMSClient:
+            """Lightweight MetaServer client using only requests + pickle"""
+            def __init__(self, address, port):
+                self._base_url = f"http://{address}:{port}"
+                self._session = requests.Session()
+
+            def put_object(self, key, obj, timeout=120):
+                """Store object on server"""
+                pickled = pickle.dumps(obj)
+                binary = struct.pack("!I", len(pickled)) + pickled
+                resp = self._session.put(f"{self._base_url}/v1/put_binary/{key}", data=binary, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+
+            def delete_if_exists(self, key):
+                """Delete data from server if it exists"""
+                try:
+                    self._session.delete(f"{self._base_url}/v1/delete/{key}", timeout=5)
+                except Exception:
+                    pass
+
+        self._ms_client = LightweightMSClient(host, port)
         self._ms_addr = meta_server_addr  # Store for passing to SGLang
         self._ms_timeout = getattr(args, "awex_timeout", 600)
         self._gpu_identity = _get_gpu_identity()

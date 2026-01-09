@@ -274,16 +274,33 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
 
-        # Import MetaServer client
-        from awex.meta import MetaServerClient
+        # Inline lightweight MetaServer client (avoid awex dependency)
+        import pickle
+        import struct
 
-        # Create client and fetch IPC handles from MetaServer
-        ms_client = MetaServerClient(meta_server_addr)
+        def from_binary(binary):
+            data_len = struct.unpack("!I", binary[:4])[0]
+            return pickle.loads(binary[4 : 4 + data_len])
+
+        def ms_get_object(addr, key, timeout=60):
+            """Get object from MetaServer"""
+            for attempt in range(10):
+                try:
+                    resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
+                    if resp.status_code == 404:
+                        raise ValueError(f"Key '{key}' not found")
+                    resp.raise_for_status()
+                    return from_binary(resp.content)
+                except Exception as e:
+                    if attempt == 9:
+                        raise
+                    time.sleep(1)
+
         key = f"weights_{gpu_identity}_v{weight_version}_c{chunk_id}"
 
         try:
             # GET IPC handles from MetaServer (KB-level data)
-            chunk_data = ms_client.get_object(key, timeout=60)
+            chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
             if chunk_data is None:
                 raise RuntimeError(f"Failed to get chunk data from MetaServer: {key}")
 
