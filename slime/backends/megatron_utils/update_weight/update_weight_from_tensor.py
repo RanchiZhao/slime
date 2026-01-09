@@ -349,15 +349,18 @@ class UpdateWeightFromTensor:
 
     def _update_weights_metaserver_p2p(self) -> None:
         """
-        Double-buffered async pipeline for weight sync.
+        P2P MetaServer weight sync: each rank PUTs directly to MetaServer.
 
         Key design:
-        - Dual buffer slots (Slot A/B) to hold tensors
-        - Reuse baseline's _send_hf_params for serialization + gather + Ray send
-        - N-2 confirmation: wait for chunk i-2 before overwriting slot
-        - Overlap: SGLang processes chunk i while Slime converts chunk i+1
+        - NO Gloo gather: each rank PUTs to MetaServer with gpu_identity key
+        - Only gather_src rank sends lightweight Ray trigger (version, chunk_id)
+        - SGLang workers GET by their own gpu_identity (same physical GPU)
+        - Double buffer slots + N-2 confirmation for memory safety
 
-        This is essentially the baseline with added pipelining for overlap.
+        Benefits:
+        - Eliminates Gloo gather overhead (6.3s for 317 chunks)
+        - Eliminates Ray payload serialization (9.5s for 317 chunks)
+        - 64-way parallel PUT/GET
         """
         t_start = time.time()
         rank = dist.get_rank()
@@ -366,7 +369,7 @@ class UpdateWeightFromTensor:
 
         if rank == 0:
             logger.info(
-                f"[Double-Buffer] Starting weight sync version={self.weight_version}..."
+                f"[MetaServer P2P] Starting weight sync version={self.weight_version}..."
             )
 
         # Flush caches first (same as baseline)
@@ -376,54 +379,60 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        # Double buffer slots to hold long_lived_tensors
+        # Double buffer slots to hold long_lived_tensors (for CUDA IPC validity)
         slots = [None, None]
-        refs_list = {}
+        futures = {}  # chunk_id -> Ray future (only on gather_src rank)
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             # 1. N-2 confirmation: ensure Slot[chunk_count % 2] is safe to overwrite
             prev_use_idx = chunk_count - 2
-            if prev_use_idx >= 0 and prev_use_idx in refs_list:
-                ray.get(refs_list[prev_use_idx])  # Block until SGLang consumed
+            if prev_use_idx >= 0 and prev_use_idx in futures:
+                ray.get(futures[prev_use_idx])  # Block until SGLang consumed
                 slots[prev_use_idx % 2] = None  # Release old tensors
 
-            # 2. Send using baseline method (handles serialization + gather + Ray)
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+            # 2. Serialize chunk (creates CUDA IPC handles, KB-level)
+            serialized_tensors, long_lived_tensors = self._serialize_chunk_for_metapipe(
+                hf_named_tensors
+            )
             slots[chunk_count % 2] = long_lived_tensors  # Hold reference!
-            refs_list[chunk_count] = refs
+
+            # 3. PUT to MetaServer with gpu_identity key (NO Gloo gather!)
+            key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_count}"
+            chunk_data = {
+                "serialized_tensors": serialized_tensors,
+                "load_format": "flattened_bucket",
+                "weight_version": str(self.weight_version),
+            }
+            self._ms_client.put_object(key, chunk_data, timeout=self._ms_timeout)
+
+            # 4. Only gather_src rank sends lightweight Ray trigger
+            if rank == self._ipc_gather_src:
+                ref = self._ipc_engine.update_weights_from_metaserver.remote(
+                    chunk_id=chunk_count,
+                    weight_version=self.weight_version,
+                    gpu_identity=self._gpu_identity,  # Pass for logging only
+                    meta_server_addr=self._ms_addr,
+                    load_format="flattened_bucket",
+                    flush_cache=False,
+                )
+                futures[chunk_count] = ref
 
             chunk_count += 1
 
         # Wait for last two chunks to complete
         for i in range(max(0, chunk_count - 2), chunk_count):
-            if i in refs_list:
-                ray.get(refs_list[i])
+            if i in futures:
+                ray.get(futures[i])
 
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
             total_time = time.time() - t_start
             logger.info(
-                f"[Double-Buffer] Weight sync complete: version={self.weight_version} "
+                f"[MetaServer P2P] Weight sync complete: version={self.weight_version} "
                 f"chunks={chunk_count} total={total_time:.3f}s"
             )
-
-    def _convert_hf_tensors_to_buckets(
-        self,
-        hf_named_tensors: list[tuple[str, torch.Tensor]],
-    ) -> dict:
-        """Convert HF tensors to dtype-grouped bucket format for SGLang."""
-        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
-            return {"dtype": hf_named_tensors}
-        else:
-            converted = {}
-            for name, tensor in hf_named_tensors:
-                dtype = tensor.dtype
-                if dtype not in converted:
-                    converted[dtype] = []
-                converted[dtype].append((name, tensor))
-            return converted
 
     def _serialize_chunk_for_metapipe(
         self,
@@ -467,16 +476,6 @@ class UpdateWeightFromTensor:
             serialized_tensors.append(serialized)
 
         return serialized_tensors, long_lived_tensors
-
-    def _send_chunk_metaserver_p2p(
-        self,
-        hf_named_tensors: list[tuple[str, torch.Tensor]],
-        chunk_id: int,
-    ) -> None:
-        """
-        [DEPRECATED] Old P2P method - use _update_weights_metaserver_p2p with Meta-Pipe instead.
-        """
-        pass
 
     def _update_weights_baseline(self) -> None:
         """

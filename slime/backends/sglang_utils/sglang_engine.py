@@ -258,15 +258,15 @@ class SGLangEngine(RayActor):
         flush_cache: bool = False,
     ):
         """
-        Meta-Pipe: Update weights by fetching IPC handles from MetaServer.
+        MetaServer P2P: Update weights by calling new HTTP endpoint.
 
-        This method is called by Ray with only lightweight parameters (int, str).
-        The actual IPC handles (KB-level) are fetched from MetaServer.
+        Each SGLang worker will fetch IPC handles from MetaServer using its own
+        gpu_identity, ensuring CUDA IPC locality.
 
         Args:
             chunk_id: Chunk index
             weight_version: Weight version number
-            gpu_identity: GPU identity string (hostname_deviceid)
+            gpu_identity: Not used (kept for compatibility, each worker uses its own)
             meta_server_addr: MetaServer address (ip:port)
             load_format: Weight format (default: flattened_bucket)
             flush_cache: Whether to flush cache
@@ -274,51 +274,17 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0:
             return
 
-        # Inline lightweight MetaServer client (avoid awex dependency)
-        import pickle
-        import struct
-
-        def from_binary(binary):
-            data_len = struct.unpack("!I", binary[:4])[0]
-            return pickle.loads(binary[4 : 4 + data_len])
-
-        def ms_get_object(addr, key, timeout=60):
-            """Get object from MetaServer"""
-            for attempt in range(10):
-                try:
-                    resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
-                    if resp.status_code == 404:
-                        raise ValueError(f"Key '{key}' not found")
-                    resp.raise_for_status()
-                    return from_binary(resp.content)
-                except Exception as e:
-                    if attempt == 9:
-                        raise
-                    time.sleep(1)
-
-        key = f"weights_{gpu_identity}_v{weight_version}_c{chunk_id}"
-
-        try:
-            # GET IPC handles from MetaServer (KB-level data)
-            chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
-            if chunk_data is None:
-                raise RuntimeError(f"Failed to get chunk data from MetaServer: {key}")
-
-            serialized_tensors = chunk_data.get("serialized_tensors", [])
-
-            # Call existing update_weights_from_tensor with the IPC handles
-            return self._make_request(
-                "update_weights_from_tensor",
-                {
-                    "serialized_named_tensors": serialized_tensors,
-                    "load_format": load_format,
-                    "flush_cache": flush_cache,
-                    "weight_version": str(weight_version),
-                },
-            )
-        except Exception as e:
-            logger.error(f"[Meta-Pipe] Failed to update weights from MetaServer: {e}")
-            raise
+        # Call the new HTTP endpoint
+        return self._make_request(
+            "update_weights_from_metaserver",
+            {
+                "chunk_id": chunk_id,
+                "weight_version": weight_version,
+                "meta_server_addr": meta_server_addr,
+                "load_format": load_format,
+                "flush_cache": flush_cache,
+            },
+        )
 
     def flush_cache(self):
         """Flush the cache of the server."""
