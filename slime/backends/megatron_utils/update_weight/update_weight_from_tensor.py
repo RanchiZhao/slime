@@ -344,13 +344,11 @@ class UpdateWeightFromTensor:
 
         Key design:
         - Dual buffer slots (Slot A/B) to hold tensors
-        - Ray handles data transfer (works cross-node)
+        - Reuse baseline's _send_hf_params for serialization + gather + Ray send
         - N-2 confirmation: wait for chunk i-2 before overwriting slot
         - Overlap: SGLang processes chunk i while Slime converts chunk i+1
 
-        NOTE: We use Ray for transfer instead of MetaServer IPC handles because
-        CUDA IPC handles are node-local and don't work cross-node.
-        Ray automatically handles same-node (IPC) vs cross-node (network copy).
+        This is essentially the baseline with added pipelining for overlap.
         """
         t_start = time.time()
         rank = dist.get_rank()
@@ -369,37 +367,29 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        # Double buffer slots to hold tensors
+        # Double buffer slots to hold long_lived_tensors
         slots = [None, None]
-        futures = {}
+        refs_list = {}
 
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             # 1. N-2 confirmation: ensure Slot[chunk_count % 2] is safe to overwrite
             prev_use_idx = chunk_count - 2
-            if prev_use_idx >= 0 and prev_use_idx in futures:
-                ray.get(futures[prev_use_idx])  # Block until SGLang consumed
+            if prev_use_idx >= 0 and prev_use_idx in refs_list:
+                ray.get(refs_list[prev_use_idx])  # Block until SGLang consumed
                 slots[prev_use_idx % 2] = None  # Release old tensors
 
-            # 2. Convert and serialize (keeps tensors in current slot)
-            converted_named_tensors_by_dtypes = self._convert_hf_tensors_to_buckets(hf_named_tensors)
-            slots[chunk_count % 2] = converted_named_tensors_by_dtypes  # Hold reference!
-
-            # 3. Async Ray call with tensor data (Ray handles cross-node transfer)
-            ref = self._ipc_engine.update_weights_from_tensor.remote(
-                hf_named_tensors=converted_named_tensors_by_dtypes,
-                load_format="flattened_bucket",
-                flush_cache=False,
-                weight_version=str(self.weight_version),
-            )
-            futures[chunk_count] = ref
+            # 2. Send using baseline method (handles serialization + gather + Ray)
+            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+            slots[chunk_count % 2] = long_lived_tensors  # Hold reference!
+            refs_list[chunk_count] = refs
 
             chunk_count += 1
 
         # Wait for last two chunks to complete
-        remaining = [futures[i] for i in range(max(0, chunk_count - 2), chunk_count) if i in futures]
-        if remaining:
-            ray.get(remaining)
+        for i in range(max(0, chunk_count - 2), chunk_count):
+            if i in refs_list:
+                ray.get(refs_list[i])
 
         dist.barrier(group=get_gloo_group())
 
