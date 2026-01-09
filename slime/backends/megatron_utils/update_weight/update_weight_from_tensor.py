@@ -396,6 +396,8 @@ class UpdateWeightFromTensor:
             weights_getter_time = time.time() - t_weights_getter_start
             # Accumulators for profiling
             total_n2_wait_time = 0.0
+            total_n2_rayget_time = 0.0  # ray.get() only
+            total_n2_barrier_time = 0.0  # barrier only
             total_serialize_time = 0.0
             total_ms_put_time = 0.0
             total_ray_trigger_time = 0.0
@@ -415,10 +417,22 @@ class UpdateWeightFromTensor:
             prev_use_idx = chunk_count - 2
             if prev_use_idx >= 0:
                 # gather_src waits for SGLang to consume chunk N-2
+                if profile_enabled:
+                    t_rayget_start = time.time()
+
                 if prev_use_idx in futures:
                     ray.get(futures[prev_use_idx])  # Block until ALL engines consumed
+
+                if profile_enabled:
+                    total_n2_rayget_time += time.time() - t_rayget_start
+                    t_barrier_start = time.time()
+
                 # ALL ranks sync here - non-gather_src waits for gather_src's confirmation
                 dist.barrier(group=get_gloo_group())
+
+                if profile_enabled:
+                    total_n2_barrier_time += time.time() - t_barrier_start
+
                 slots[prev_use_idx % 2] = None  # Now safe to release old tensors
 
             if profile_enabled:
@@ -498,9 +512,10 @@ class UpdateWeightFromTensor:
         if profile_enabled and rank == 0:
             log_msg = (
                 f"[P2P Profile] chunks={chunk_count} weights_getter={weights_getter_time:.3f}s "
-                f"n2_wait={total_n2_wait_time:.3f}s serialize={total_serialize_time:.3f}s "
-                f"ms_put={total_ms_put_time:.3f}s ray_trigger={total_ray_trigger_time:.3f}s "
-                f"final_wait={final_wait_time:.3f}s chunks_loop={chunks_time:.3f}s total={total_time:.3f}s"
+                f"n2_total={total_n2_wait_time:.3f}s (rayget={total_n2_rayget_time:.3f}s barrier={total_n2_barrier_time:.3f}s) "
+                f"serialize={total_serialize_time:.3f}s ms_put={total_ms_put_time:.3f}s "
+                f"ray_trigger={total_ray_trigger_time:.3f}s final_wait={final_wait_time:.3f}s "
+                f"chunks_loop={chunks_time:.3f}s total={total_time:.3f}s"
             )
             print(log_msg, flush=True)
             try:
