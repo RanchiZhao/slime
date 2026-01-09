@@ -373,6 +373,7 @@ class UpdateWeightFromTensor:
         """
         t_start = time.time()
         rank = dist.get_rank()
+        profile_enabled = _is_baseline_profile_enabled()
 
         self.weight_version += 1
 
@@ -386,7 +387,19 @@ class UpdateWeightFromTensor:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
+        if profile_enabled:
+            t_weights_getter_start = time.time()
+
         megatron_local_weights = self.weights_getter()
+
+        if profile_enabled:
+            weights_getter_time = time.time() - t_weights_getter_start
+            # Accumulators for profiling
+            total_n2_wait_time = 0.0
+            total_serialize_time = 0.0
+            total_ms_put_time = 0.0
+            total_ray_trigger_time = 0.0
+            t_chunks_start = time.time()
 
         # Double buffer slots to hold long_lived_tensors (for CUDA IPC validity)
         slots = [None, None]
@@ -395,16 +408,29 @@ class UpdateWeightFromTensor:
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             # 1. N-2 confirmation: ensure Slot[chunk_count % 2] is safe to overwrite
+            if profile_enabled:
+                t_n2_start = time.time()
+
             prev_use_idx = chunk_count - 2
             if prev_use_idx >= 0 and prev_use_idx in futures:
                 ray.get(futures[prev_use_idx])  # Block until SGLang consumed
                 slots[prev_use_idx % 2] = None  # Release old tensors
+
+            if profile_enabled:
+                n2_wait_time = time.time() - t_n2_start
+                total_n2_wait_time += n2_wait_time
+                t_serialize_start = time.time()
 
             # 2. Serialize chunk (creates CUDA IPC handles, KB-level)
             serialized_tensors, long_lived_tensors = self._serialize_chunk_for_metapipe(
                 hf_named_tensors
             )
             slots[chunk_count % 2] = long_lived_tensors  # Hold reference!
+
+            if profile_enabled:
+                serialize_time = time.time() - t_serialize_start
+                total_serialize_time += serialize_time
+                t_ms_put_start = time.time()
 
             # 3. PUT to MetaServer with gpu_identity key (NO Gloo gather!)
             key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_count}"
@@ -414,6 +440,11 @@ class UpdateWeightFromTensor:
                 "weight_version": str(self.weight_version),
             }
             self._ms_client.put_object(key, chunk_data, timeout=self._ms_timeout)
+
+            if profile_enabled:
+                ms_put_time = time.time() - t_ms_put_start
+                total_ms_put_time += ms_put_time
+                t_ray_start = time.time()
 
             # 4. Only gather_src rank sends lightweight Ray trigger
             if rank == self._ipc_gather_src:
@@ -427,21 +458,49 @@ class UpdateWeightFromTensor:
                 )
                 futures[chunk_count] = ref
 
+            if profile_enabled:
+                ray_trigger_time = time.time() - t_ray_start
+                total_ray_trigger_time += ray_trigger_time
+
             chunk_count += 1
 
         # Wait for last two chunks to complete
+        if profile_enabled:
+            t_final_wait_start = time.time()
+
         for i in range(max(0, chunk_count - 2), chunk_count):
             if i in futures:
                 ray.get(futures[i])
 
+        if profile_enabled:
+            final_wait_time = time.time() - t_final_wait_start
+            chunks_time = time.time() - t_chunks_start
+
         dist.barrier(group=get_gloo_group())
 
+        total_time = time.time() - t_start
         if rank == 0:
-            total_time = time.time() - t_start
             logger.info(
                 f"[MetaServer P2P] Weight sync complete: version={self.weight_version} "
                 f"chunks={chunk_count} total={total_time:.3f}s"
             )
+
+        # Detailed profiling output
+        if profile_enabled and rank == 0:
+            log_msg = (
+                f"[P2P Profile] chunks={chunk_count} weights_getter={weights_getter_time:.3f}s "
+                f"n2_wait={total_n2_wait_time:.3f}s serialize={total_serialize_time:.3f}s "
+                f"ms_put={total_ms_put_time:.3f}s ray_trigger={total_ray_trigger_time:.3f}s "
+                f"final_wait={final_wait_time:.3f}s chunks_loop={chunks_time:.3f}s total={total_time:.3f}s"
+            )
+            print(log_msg, flush=True)
+            try:
+                with open("/mnt/hisys-data/yqzhao/p2p_profile.log", "a") as f:
+                    f.write(log_msg + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
 
     def _serialize_chunk_for_metapipe(
         self,
