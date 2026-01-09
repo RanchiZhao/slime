@@ -51,6 +51,12 @@ def _get_gpu_identity():
     import socket
     hostname = socket.gethostname()
     device_id = torch.cuda.current_device()
+    # DEBUG: Log for troubleshooting IPC issues
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    logger.info(
+        f"[MetaServer P2P DEBUG] Slime rank={rank}, hostname={hostname}, "
+        f"cuda.current_device()={device_id}, identity={hostname}_{device_id}"
+    )
     return f"{hostname}_{device_id}"
 
 
