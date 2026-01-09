@@ -340,15 +340,17 @@ class UpdateWeightFromTensor:
 
     def _update_weights_metaserver_p2p(self) -> None:
         """
-        Meta-Pipe: Double-buffered async pipeline with MetaServer.
+        Double-buffered async pipeline for weight sync.
 
         Key design:
-        - Dual buffer slots (Slot A/B) to hold long_lived_tensors
-        - IPC handles via MetaServer (KB-level, not GB)
-        - Ray calls only pass chunk_id (int), as trigger + ACK
+        - Dual buffer slots (Slot A/B) to hold tensors
+        - Ray handles data transfer (works cross-node)
         - N-2 confirmation: wait for chunk i-2 before overwriting slot
+        - Overlap: SGLang processes chunk i while Slime converts chunk i+1
 
-        Expected savings: ~16s (40s → 24s)
+        NOTE: We use Ray for transfer instead of MetaServer IPC handles because
+        CUDA IPC handles are node-local and don't work cross-node.
+        Ray automatically handles same-node (IPC) vs cross-node (network copy).
         """
         t_start = time.time()
         rank = dist.get_rank()
@@ -357,7 +359,7 @@ class UpdateWeightFromTensor:
 
         if rank == 0:
             logger.info(
-                f"[Meta-Pipe] Starting weight sync version={self.weight_version}..."
+                f"[Double-Buffer] Starting weight sync version={self.weight_version}..."
             )
 
         # Flush caches first (same as baseline)
@@ -367,7 +369,7 @@ class UpdateWeightFromTensor:
 
         megatron_local_weights = self.weights_getter()
 
-        # Double buffer slots to hold long_lived_tensors
+        # Double buffer slots to hold tensors
         slots = [None, None]
         futures = {}
 
@@ -379,26 +381,16 @@ class UpdateWeightFromTensor:
                 ray.get(futures[prev_use_idx])  # Block until SGLang consumed
                 slots[prev_use_idx % 2] = None  # Release old tensors
 
-            # 2. Serialize and store in current slot (keeps tensors alive for IPC)
-            serialized_tensors, long_lived_tensors = self._serialize_chunk_for_metapipe(hf_named_tensors)
-            slots[chunk_count % 2] = long_lived_tensors  # Hold reference!
+            # 2. Convert and serialize (keeps tensors in current slot)
+            converted_named_tensors_by_dtypes = self._convert_hf_tensors_to_buckets(hf_named_tensors)
+            slots[chunk_count % 2] = converted_named_tensors_by_dtypes  # Hold reference!
 
-            # 3. PUT IPC handles to MetaServer (fast, KB-level)
-            key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_count}"
-            self._ms_client.put_object(key, {
-                "serialized_tensors": serialized_tensors,
-                "load_format": "flattened_bucket",
-                "weight_version": str(self.weight_version),
-                "chunk_id": chunk_count,
-                "gpu_identity": self._gpu_identity,
-            })
-
-            # 4. Async Ray call - only pass chunk_id (int), not big data!
-            ref = self._ipc_engine.update_weights_from_metaserver.remote(
-                chunk_id=chunk_count,
-                weight_version=self.weight_version,
-                gpu_identity=self._gpu_identity,
-                meta_server_addr=self._ms_addr,
+            # 3. Async Ray call with tensor data (Ray handles cross-node transfer)
+            ref = self._ipc_engine.update_weights_from_tensor.remote(
+                hf_named_tensors=converted_named_tensors_by_dtypes,
+                load_format="flattened_bucket",
+                flush_cache=False,
+                weight_version=str(self.weight_version),
             )
             futures[chunk_count] = ref
 
@@ -409,22 +401,30 @@ class UpdateWeightFromTensor:
         if remaining:
             ray.get(remaining)
 
-        # Cleanup MetaServer keys
-        for chunk_id in range(chunk_count):
-            weights_key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_id}"
-            try:
-                self._ms_client.delete_if_exists(weights_key)
-            except Exception:
-                pass
-
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
             total_time = time.time() - t_start
             logger.info(
-                f"[Meta-Pipe] Weight sync complete: version={self.weight_version} "
+                f"[Double-Buffer] Weight sync complete: version={self.weight_version} "
                 f"chunks={chunk_count} total={total_time:.3f}s"
             )
+
+    def _convert_hf_tensors_to_buckets(
+        self,
+        hf_named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> dict:
+        """Convert HF tensors to dtype-grouped bucket format for SGLang."""
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            return {"dtype": hf_named_tensors}
+        else:
+            converted = {}
+            for name, tensor in hf_named_tensors:
+                dtype = tensor.dtype
+                if dtype not in converted:
+                    converted[dtype] = []
+                converted[dtype].append((name, tensor))
+            return converted
 
     def _serialize_chunk_for_metapipe(
         self,
