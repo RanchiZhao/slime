@@ -408,13 +408,18 @@ class UpdateWeightFromTensor:
         chunk_count = 0
         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
             # 1. N-2 confirmation: ensure Slot[chunk_count % 2] is safe to overwrite
+            # Only gather_src has futures, but ALL ranks must wait before overwriting
             if profile_enabled:
                 t_n2_start = time.time()
 
             prev_use_idx = chunk_count - 2
-            if prev_use_idx >= 0 and prev_use_idx in futures:
-                ray.get(futures[prev_use_idx])  # Block until SGLang consumed
-                slots[prev_use_idx % 2] = None  # Release old tensors
+            if prev_use_idx >= 0:
+                # gather_src waits for SGLang to consume chunk N-2
+                if prev_use_idx in futures:
+                    ray.get(futures[prev_use_idx])  # Block until ALL engines consumed
+                # ALL ranks sync here - non-gather_src waits for gather_src's confirmation
+                dist.barrier(group=get_gloo_group())
+                slots[prev_use_idx % 2] = None  # Now safe to release old tensors
 
             if profile_enabled:
                 n2_wait_time = time.time() - t_n2_start
@@ -446,17 +451,21 @@ class UpdateWeightFromTensor:
                 total_ms_put_time += ms_put_time
                 t_ray_start = time.time()
 
-            # 4. Only gather_src rank sends lightweight Ray trigger
+            # 4. Only gather_src rank sends Ray triggers to ALL engines
+            # (Each engine's TpWorkers will GET using their own UUIDs)
             if rank == self._ipc_gather_src:
-                ref = self._ipc_engine.update_weights_from_metaserver.remote(
-                    chunk_id=chunk_count,
-                    weight_version=self.weight_version,
-                    gpu_identity=self._gpu_identity,  # Pass for logging only
-                    meta_server_addr=self._ms_addr,
-                    load_format="flattened_bucket",
-                    flush_cache=False,
-                )
-                futures[chunk_count] = ref
+                refs = []
+                for engine in self.rollout_engines:
+                    ref = engine.update_weights_from_metaserver.remote(
+                        chunk_id=chunk_count,
+                        weight_version=self.weight_version,
+                        gpu_identity=self._gpu_identity,  # Pass for logging only
+                        meta_server_addr=self._ms_addr,
+                        load_format="flattened_bucket",
+                        flush_cache=False,
+                    )
+                    refs.append(ref)
+                futures[chunk_count] = refs  # Store list of refs for all engines
 
             if profile_enabled:
                 ray_trigger_time = time.time() - t_ray_start
@@ -470,7 +479,7 @@ class UpdateWeightFromTensor:
 
         for i in range(max(0, chunk_count - 2), chunk_count):
             if i in futures:
-                ray.get(futures[i])
+                ray.get(futures[i])  # Wait for all engines
 
         if profile_enabled:
             final_wait_time = time.time() - t_final_wait_start
