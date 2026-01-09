@@ -35,6 +35,24 @@ from .update_weight_from_distributed import (
 )
 
 
+def _is_awex_enabled(args):
+    """Check if awex integration is enabled."""
+    return getattr(args, "use_awex", False)
+
+
+def _is_metaserver_p2p_enabled(args):
+    """Check if MetaServer P2P mode is enabled."""
+    return getattr(args, "use_metaserver_p2p", False)
+
+
+def _get_gpu_identity():
+    """Get unique GPU identity: hostname_deviceid."""
+    import socket
+    hostname = socket.gethostname()
+    device_id = torch.cuda.current_device()
+    return f"{hostname}_{device_id}"
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
@@ -62,8 +80,69 @@ class UpdateWeightFromTensor:
         self.quantization_config = quantization_config
         self.weight_version = 0
 
+        # Check which mode is enabled
+        self._use_awex = _is_awex_enabled(args)
+        self._use_metaserver_p2p = _is_metaserver_p2p_enabled(args)
+        self._awex_sender = None
+        self._ms_client = None
+
+        if self._use_awex:
+            self._init_awex(args, model, weights_getter)
+        elif self._use_metaserver_p2p:
+            self._init_metaserver_p2p(args, model)
+        else:
+            self._init_baseline(args, model)
+
+        self._model_update_groups = None
+
+    def _init_awex(
+        self,
+        args: Namespace,
+        model: Sequence[torch.nn.Module],
+        weights_getter: Callable,
+    ) -> None:
+        """Initialize awex integration for optimized weight sync."""
+        from .awex_integration import (
+            AwexIntegrationConfig,
+            AwexWeightSender,
+            SlimeAwexTrainEngine,
+        )
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logger.info("[UpdateWeightFromTensor] Initializing awex integration...")
+
+        # Get HF config for awex
+        hf_config = self._get_hf_config()
+
+        # Create awex config
+        awex_config = AwexIntegrationConfig.from_slime_args(args)
+
+        # Create train engine adapter
+        train_engine = SlimeAwexTrainEngine(
+            model=model,
+            hf_config=hf_config,
+            config=awex_config,
+            weights_getter=weights_getter,
+        )
+
+        # Create weight sender
+        self._awex_sender = AwexWeightSender(train_engine, awex_config)
+
+        if rank == 0:
+            logger.info("[UpdateWeightFromTensor] Awex integration initialized")
+
+    def _init_baseline(
+        self,
+        args: Namespace,
+        model: Sequence[torch.nn.Module],
+    ) -> None:
+        """Initialize baseline chunk-based weight sync."""
         self._hf_weight_iterator = HfWeightIteratorBase.create(
-            args=args, model=model, model_name=model_name, quantization_config=quantization_config
+            args=args,
+            model=model,
+            model_name=self.model_name,
+            quantization_config=self.quantization_config,
         )
 
         # create the group within megatron.
@@ -75,7 +154,81 @@ class UpdateWeightFromTensor:
                 self._ipc_gather_group = new_group
                 self._ipc_gather_src = start_rank
 
-        self._model_update_groups = None
+    def _init_metaserver_p2p(
+        self,
+        args: Namespace,
+        model: Sequence[torch.nn.Module],
+    ) -> None:
+        """
+        Initialize MetaServer P2P mode.
+
+        Key difference from baseline:
+        - No Gloo gather (each rank PUTs directly to MetaServer)
+        - Use GPU identity (hostname_deviceid) as key instead of rank number
+        - SGLang workers GET by their own GPU identity
+        """
+        # Initialize HF weight iterator (same as baseline)
+        self._hf_weight_iterator = HfWeightIteratorBase.create(
+            args=args,
+            model=model,
+            model_name=self.model_name,
+            quantization_config=self.quantization_config,
+        )
+
+        # Initialize MetaServer client
+        meta_server_addr = getattr(args, "awex_meta_server_addr", None)
+        if not meta_server_addr:
+            raise ValueError("--awex-meta-server-addr is required for --use-metaserver-p2p")
+
+        # Parse address
+        if ":" in meta_server_addr:
+            host, port = meta_server_addr.rsplit(":", 1)
+            port = int(port)
+        else:
+            raise ValueError(f"Invalid meta_server_addr format: {meta_server_addr}, expected 'ip:port'")
+
+        # Import and create MetaServer client
+        import sys
+        sys.path.insert(0, "/mnt/hisys-data/yqzhao/asystem-awex")
+        from awex.meta.meta_server import MetaServerClient
+
+        self._ms_client = MetaServerClient(host, port)
+        self._ms_addr = meta_server_addr  # Store for passing to SGLang
+        self._ms_timeout = getattr(args, "awex_timeout", 600)
+        self._gpu_identity = _get_gpu_identity()
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logger.info(
+                f"[MetaServer P2P] Initialized: addr={meta_server_addr}, "
+                f"gpu_identity={self._gpu_identity}, timeout={self._ms_timeout}s"
+            )
+
+        # Still need engine mapping for coordination (which engine this rank belongs to)
+        for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
+            end_rank = start_rank + self.args.rollout_num_gpus_per_engine
+            group_ranks = list(range(start_rank, end_rank))
+            if dist.get_rank() in group_ranks:
+                self._engine_id = start_rank // self.args.rollout_num_gpus_per_engine
+
+    def _get_hf_config(self):
+        """Get HuggingFace config for the model."""
+        # Use args.hf_checkpoint which is the correct path
+        hf_checkpoint = getattr(self.args, "hf_checkpoint", None)
+        if hf_checkpoint is None:
+            hf_checkpoint = self.model_name
+
+        if hf_checkpoint is None:
+            logger.error("Neither hf_checkpoint nor model_name is set, cannot load HF config")
+            return None
+
+        try:
+            from transformers import AutoConfig
+
+            return AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+        except Exception as e:
+            logger.warning(f"Failed to load HF config from {hf_checkpoint}: {e}")
+            return None
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -119,6 +272,193 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        """
+        Update weights to inference engines.
+
+        Uses awex path if enabled, MetaServer P2P if enabled, otherwise baseline chunk loop.
+        """
+        if self._use_awex:
+            self._update_weights_awex()
+        elif self._use_metaserver_p2p:
+            self._update_weights_metaserver_p2p()
+        else:
+            self._update_weights_baseline()
+
+    def _update_weights_awex(self) -> None:
+        """
+        Awex optimized path: single call replaces 317 chunk loop.
+
+        Expected savings: ~12s (Ray round-trip overhead elimination)
+        """
+        t_start = time.time()
+        rank = dist.get_rank()
+
+        self.weight_version += 1
+
+        if rank == 0:
+            logger.info(
+                f"[Awex] Starting weight sync version={self.weight_version}..."
+            )
+
+        # Flush caches first (same as baseline)
+        if rank == 0:
+            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+
+        # Single awex call replaces the entire chunk loop
+        self._awex_sender.update_weights()
+
+        dist.barrier(group=get_gloo_group())
+
+        if rank == 0:
+            total_time = time.time() - t_start
+            logger.info(
+                f"[Awex] Weight sync complete: version={self.weight_version} "
+                f"total={total_time:.3f}s"
+            )
+
+    def _update_weights_metaserver_p2p(self) -> None:
+        """
+        Meta-Pipe: Double-buffered async pipeline with MetaServer.
+
+        Key design:
+        - Dual buffer slots (Slot A/B) to hold long_lived_tensors
+        - IPC handles via MetaServer (KB-level, not GB)
+        - Ray calls only pass chunk_id (int), as trigger + ACK
+        - N-2 confirmation: wait for chunk i-2 before overwriting slot
+
+        Expected savings: ~16s (40s → 24s)
+        """
+        t_start = time.time()
+        rank = dist.get_rank()
+
+        self.weight_version += 1
+
+        if rank == 0:
+            logger.info(
+                f"[Meta-Pipe] Starting weight sync version={self.weight_version}..."
+            )
+
+        # Flush caches first (same as baseline)
+        if rank == 0:
+            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+
+        megatron_local_weights = self.weights_getter()
+
+        # Double buffer slots to hold long_lived_tensors
+        slots = [None, None]
+        futures = {}
+
+        chunk_count = 0
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            # 1. N-2 confirmation: ensure Slot[chunk_count % 2] is safe to overwrite
+            prev_use_idx = chunk_count - 2
+            if prev_use_idx >= 0 and prev_use_idx in futures:
+                ray.get(futures[prev_use_idx])  # Block until SGLang consumed
+                slots[prev_use_idx % 2] = None  # Release old tensors
+
+            # 2. Serialize and store in current slot (keeps tensors alive for IPC)
+            serialized_tensors, long_lived_tensors = self._serialize_chunk_for_metapipe(hf_named_tensors)
+            slots[chunk_count % 2] = long_lived_tensors  # Hold reference!
+
+            # 3. PUT IPC handles to MetaServer (fast, KB-level)
+            key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_count}"
+            self._ms_client.put_object(key, {
+                "serialized_tensors": serialized_tensors,
+                "load_format": "flattened_bucket",
+                "weight_version": str(self.weight_version),
+                "chunk_id": chunk_count,
+                "gpu_identity": self._gpu_identity,
+            })
+
+            # 4. Async Ray call - only pass chunk_id (int), not big data!
+            ref = self._ipc_engine.update_weights_from_metaserver.remote(
+                chunk_id=chunk_count,
+                weight_version=self.weight_version,
+                gpu_identity=self._gpu_identity,
+                meta_server_addr=self._ms_addr,
+            )
+            futures[chunk_count] = ref
+
+            chunk_count += 1
+
+        # Wait for last two chunks to complete
+        remaining = [futures[i] for i in range(max(0, chunk_count - 2), chunk_count) if i in futures]
+        if remaining:
+            ray.get(remaining)
+
+        # Cleanup MetaServer keys
+        for chunk_id in range(chunk_count):
+            weights_key = f"weights_{self._gpu_identity}_v{self.weight_version}_c{chunk_id}"
+            try:
+                self._ms_client.delete_if_exists(weights_key)
+            except Exception:
+                pass
+
+        dist.barrier(group=get_gloo_group())
+
+        if rank == 0:
+            total_time = time.time() - t_start
+            logger.info(
+                f"[Meta-Pipe] Weight sync complete: version={self.weight_version} "
+                f"chunks={chunk_count} total={total_time:.3f}s"
+            )
+
+    def _serialize_chunk_for_metapipe(
+        self,
+        hf_named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[str], list[dict]]:
+        """
+        Serialize chunk using CUDA IPC handles (KB-level, not GB).
+
+        Returns:
+            serialized_tensors: List of serialized strings (with IPC handles)
+            long_lived_tensors: List of dicts to keep alive (for IPC validity)
+        """
+        long_lived_tensors = []
+
+        # Group by dtype
+        if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+            converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors}
+        else:
+            converted_named_tensors_by_dtypes = {}
+            for name, tensor in hf_named_tensors:
+                dtype = tensor.dtype
+                if dtype not in converted_named_tensors_by_dtypes:
+                    converted_named_tensors_by_dtypes[dtype] = []
+                converted_named_tensors_by_dtypes[dtype].append((name, tensor))
+
+        serialized_tensors = []
+        for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            metadata = flattened_tensor_bucket.get_metadata()
+            flattened_tensor = flattened_tensor_bucket.get_flattened_tensor()
+
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor,
+                "metadata": metadata,
+            }
+            # Keep reference alive for CUDA IPC to work
+            long_lived_tensors.append(flattened_tensor_data)
+
+            # Use MultiprocessingSerializer → generates CUDA IPC handles (KB, not GB!)
+            serialized = MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True)
+            serialized_tensors.append(serialized)
+
+        return serialized_tensors, long_lived_tensors
+
+    def _send_chunk_metaserver_p2p(
+        self,
+        hf_named_tensors: list[tuple[str, torch.Tensor]],
+        chunk_id: int,
+    ) -> None:
+        """
+        [DEPRECATED] Old P2P method - use _update_weights_metaserver_p2p with Meta-Pipe instead.
+        """
+        pass
+
+    def _update_weights_baseline(self) -> None:
         """
         version++, flush caches, process buckets. Progress on rank 0.
         """

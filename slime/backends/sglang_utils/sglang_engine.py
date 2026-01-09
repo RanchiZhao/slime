@@ -248,6 +248,61 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def update_weights_from_metaserver(
+        self,
+        chunk_id: int,
+        weight_version: int,
+        gpu_identity: str,
+        meta_server_addr: str,
+        load_format: str = "flattened_bucket",
+        flush_cache: bool = False,
+    ):
+        """
+        Meta-Pipe: Update weights by fetching IPC handles from MetaServer.
+
+        This method is called by Ray with only lightweight parameters (int, str).
+        The actual IPC handles (KB-level) are fetched from MetaServer.
+
+        Args:
+            chunk_id: Chunk index
+            weight_version: Weight version number
+            gpu_identity: GPU identity string (hostname_deviceid)
+            meta_server_addr: MetaServer address (ip:port)
+            load_format: Weight format (default: flattened_bucket)
+            flush_cache: Whether to flush cache
+        """
+        if self.node_rank != 0:
+            return
+
+        # Import MetaServer client
+        from awex.meta import MetaServerClient
+
+        # Create client and fetch IPC handles from MetaServer
+        ms_client = MetaServerClient(meta_server_addr)
+        key = f"weights_{gpu_identity}_v{weight_version}_c{chunk_id}"
+
+        try:
+            # GET IPC handles from MetaServer (KB-level data)
+            chunk_data = ms_client.get_object(key, timeout=60)
+            if chunk_data is None:
+                raise RuntimeError(f"Failed to get chunk data from MetaServer: {key}")
+
+            serialized_tensors = chunk_data.get("serialized_tensors", [])
+
+            # Call existing update_weights_from_tensor with the IPC handles
+            return self._make_request(
+                "update_weights_from_tensor",
+                {
+                    "serialized_named_tensors": serialized_tensors,
+                    "load_format": load_format,
+                    "flush_cache": flush_cache,
+                    "weight_version": str(weight_version),
+                },
+            )
+        except Exception as e:
+            logger.error(f"[Meta-Pipe] Failed to update weights from MetaServer: {e}")
+            raise
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -429,6 +484,22 @@ def _compute_server_args(
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
     }
+
+    # Awex integration: pass awex parameters to SGLang
+    if getattr(args, "use_awex", False):
+        kwargs["enable_awex"] = True
+        kwargs["meta_server_addr"] = getattr(args, "awex_meta_server_addr", None)
+        kwargs["enable_colocate_mode"] = getattr(args, "awex_colocate_mode", True)
+        # Calculate num_engines and engine_rank for awex coordination
+        num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
+        num_engines = args.rollout_num_gpus // num_gpu_per_engine
+        kwargs["num_engines"] = num_engines
+        kwargs["engine_rank"] = rank  # rank is passed to _compute_server_args
+
+    # MetaServer P2P: pass parameters to SGLang
+    if getattr(args, "use_metaserver_p2p", False):
+        kwargs["enable_metaserver_p2p"] = True
+        kwargs["meta_server_addr"] = getattr(args, "awex_meta_server_addr", None)
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"

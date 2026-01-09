@@ -104,6 +104,66 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
+            # Awex integration for optimized weight synchronization
+            parser.add_argument(
+                "--use-awex",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable awex optimized weight synchronization. "
+                    "This eliminates the chunk loop overhead (317 chunks × 38.5ms = 12s+). "
+                    "Requires --awex-meta-server-addr to be set."
+                ),
+            )
+            parser.add_argument(
+                "--awex-meta-server-addr",
+                type=str,
+                default=None,
+                help=(
+                    "MetaServer address for awex weight sync, format: 'ip:port'. "
+                    "Required when --use-awex is enabled. "
+                    "Start MetaServer with: python /mnt/hisys-data/yqzhao/start_meta_server.py"
+                ),
+            )
+            parser.add_argument(
+                "--awex-colocate-mode",
+                action="store_true",
+                default=True,
+                help="Enable awex colocate mode (training/inference share GPU). Default: True.",
+            )
+            parser.add_argument(
+                "--awex-ipc-backend",
+                type=str,
+                choices=["cuda", "cpu"],
+                default="cuda",
+                help="IPC backend for awex weight transfer. Default: cuda.",
+            )
+            parser.add_argument(
+                "--awex-timeout",
+                type=int,
+                default=600,
+                help="Timeout in seconds for awex operations. Default: 600.",
+            )
+            parser.add_argument(
+                "--awex-debug",
+                action="store_true",
+                default=False,
+                help="Enable awex debug mode for detailed logging.",
+            )
+
+            # MetaServer P2P mode (alternative to awex, simpler implementation)
+            parser.add_argument(
+                "--use-metaserver-p2p",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable MetaServer P2P weight synchronization. "
+                    "Each rank PUTs directly to MetaServer (no gather), "
+                    "SGLang workers GET by GPU identity (hostname_deviceid). "
+                    "Requires --awex-meta-server-addr to be set."
+                ),
+            )
+
             reset_arg(parser, "--distributed-backend", type=str, default="nccl")
             reset_arg(parser, "--distributed-timeout-minutes", type=int, default=10)
 
