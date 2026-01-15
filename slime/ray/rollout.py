@@ -83,7 +83,15 @@ class RolloutManager:
         # when doing multi-node serving, we will only send request to node-0 for each engine.
         return self.all_rollout_engines[:: self.nodes_per_engine]
 
-    def get_rollout_engines_and_lock(self):
+    def get_rollout_engines_and_lock(self, return_all_engines: bool = False):
+        """Get rollout engines and lock.
+
+        Args:
+            return_all_engines: If True, return all engines (for AWEX per-node mode).
+                              If False, return only node-0 engines (default behavior).
+        """
+        if return_all_engines:
+            return self.all_rollout_engines, self.rollout_engine_lock, self.num_new_engines
         return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
     def get_num_rollout_per_epoch(self):

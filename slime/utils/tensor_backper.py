@@ -68,9 +68,32 @@ class _TensorBackuperNormal(TensorBackuper):
     @torch.no_grad()
     def restore(self, tag: str) -> None:
         backup_dict = self._backups[tag]
-        for name, param in self._source_getter():
-            assert name in backup_dict
-            param.copy_(backup_dict[name], non_blocking=True)
+        import logging
+        logger = logging.getLogger(__name__)
+        for i, (name, param) in enumerate(self._source_getter()):
+            assert name in backup_dict, f"Parameter {name} not found in backup"
+            backup_tensor = backup_dict[name]
+            # CUDA pointer diagnostics for first few parameters
+            if i < 3 or "embed" in name:
+                logger.info(f"[restore {tag}] {name}")
+                logger.info(f"  param.data_ptr()    = {param.data_ptr()}")
+                logger.info(f"  param.storage_ptr() = {param.storage().data_ptr()}")
+                logger.info(f"  param.is_contiguous = {param.is_contiguous()}")
+                logger.info(f"  backup device       = {backup_tensor.device}")
+
+            try:
+                param.copy_(backup_tensor, non_blocking=True)
+            except RuntimeError as e:
+                logger.error(f"[restore {tag}] FAILED at {name} (index {i})")
+                logger.error(f"  Error: {e}")
+                logger.error(f"  param.data_ptr()    = {param.data_ptr()}")
+                logger.error(f"  param.storage_ptr() = {param.storage().data_ptr()}")
+                logger.error(f"  param.is_contiguous = {param.is_contiguous()}")
+                logger.error(f"  param shape:  {param.shape}, dtype: {param.dtype}")
+                logger.error(f"  backup shape: {backup_tensor.shape}, dtype: {backup_tensor.dtype}")
+                logger.error(f"  CUDA memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                logger.error(f"  CUDA memory reserved:  {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+                raise
         torch.cuda.synchronize()
 
 

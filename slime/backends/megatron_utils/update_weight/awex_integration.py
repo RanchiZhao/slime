@@ -23,6 +23,12 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+def _get_torch_memory_saver():
+    """Lazy import torch_memory_saver to avoid init at module load time."""
+    from torch_memory_saver import torch_memory_saver
+    return torch_memory_saver
+
+
 @dataclass
 class AwexIntegrationConfig:
     """
@@ -84,6 +90,7 @@ class SlimeAwexTrainEngine:
         hf_config: HuggingFace model config
         config: AwexIntegrationConfig
         weights_getter: Callable to get current weights
+        offload_train: Whether training uses offload mode (torch_memory_saver)
     """
 
     def __init__(
@@ -92,6 +99,7 @@ class SlimeAwexTrainEngine:
         hf_config: Any,
         config: AwexIntegrationConfig,
         weights_getter: Callable,
+        offload_train: bool = False,
     ):
         if not model:
             raise ValueError("model list cannot be empty")
@@ -108,29 +116,52 @@ class SlimeAwexTrainEngine:
         self.enable_debug_mode = config.enable_debug_mode
         self.engine_name = "mcore"  # Megatron-Core
         self._weights_getter = weights_getter
+        self._offload_train = offload_train
 
-        # For memory management callbacks (to be set by UpdateWeightFromTensor)
-        self._release_memory_callback = None
-        self._resume_memory_callback = None
-
-    def set_memory_callbacks(
-        self,
-        release_callback: Callable | None = None,
-        resume_callback: Callable | None = None,
-    ):
-        """Set memory management callbacks for colocate mode."""
-        self._release_memory_callback = release_callback
-        self._resume_memory_callback = resume_callback
+        # Track memory state for idempotent operations
+        # In Slime's offload_train mode:
+        # - torch_memory_saver.pause() is called in actor.sleep()
+        # - torch_memory_saver.disable() in update_weights() does NOT resume paused memory
+        # - We need to call resume()/pause() directly for AWEX's memory management to work
+        self._memory_resumed = False
 
     def release_memory_occupation(self, tags: list[str] | str | None = None):
-        """Release memory occupation (needed in colocate mode)."""
-        if self._release_memory_callback is not None:
-            self._release_memory_callback(tags)
+        """Release memory occupation (needed in colocate mode).
+
+        In Slime's offload_train mode, this calls torch_memory_saver.pause()
+        to actually offload GPU memory. The tags parameter is ignored since
+        torch_memory_saver doesn't support fine-grained control.
+        """
+        if not self._offload_train:
+            return
+
+        if self._memory_resumed:
+            logger.info(f"[SlimeAwexTrainEngine] Releasing memory (tags={tags}), calling torch_memory_saver.pause()")
+            _get_torch_memory_saver().pause()
+            self._memory_resumed = False
+        else:
+            logger.debug(f"[SlimeAwexTrainEngine] release_memory_occupation(tags={tags}) - already paused, skipping")
 
     def resume_memory_occupation(self, tags: list[str] | str | None = None):
-        """Resume memory occupation."""
-        if self._resume_memory_callback is not None:
-            self._resume_memory_callback(tags)
+        """Resume memory occupation.
+
+        In Slime's offload_train mode, this calls torch_memory_saver.resume()
+        to restore GPU memory. The tags parameter is ignored since
+        torch_memory_saver doesn't support fine-grained control.
+
+        CRITICAL: In Slime, actor.py wraps update_weights() with torch_memory_saver.disable(),
+        but disable() only disables allocation hooks - it does NOT resume paused memory!
+        We must call resume() explicitly for AWEX to access model weights.
+        """
+        if not self._offload_train:
+            return
+
+        if not self._memory_resumed:
+            logger.info(f"[SlimeAwexTrainEngine] Resuming memory (tags={tags}), calling torch_memory_saver.resume()")
+            _get_torch_memory_saver().resume()
+            self._memory_resumed = True
+        else:
+            logger.debug(f"[SlimeAwexTrainEngine] resume_memory_occupation(tags={tags}) - already resumed, skipping")
 
     def release_grad_memory(self):
         """Release gradient memory."""

@@ -131,6 +131,7 @@ class MegatronTrainRayActor(TrainRayActor):
             weights_getter=lambda: self.weights_backuper.get("actor"),
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
+            hf_config=self.hf_config,
         )
 
         # empty cache after initialization
@@ -174,6 +175,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups()
+
+        # Ensure all CUDA operations are complete before continuing
+        # This is critical after AWEX weight sync which may have async NCCL operations
+        torch.cuda.synchronize()
+
         print_memory("after wake_up model")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
@@ -226,6 +232,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def _switch_model(self, target_tag: str) -> None:
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+
+        # Ensure CUDA is fully synchronized before restore
+        # This prevents issues from async NCCL operations (e.g., from AWEX)
+        torch.cuda.synchronize()
+
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
 
@@ -485,39 +496,136 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
-        if self.args.offload_train:
+        use_awex = getattr(self.args, 'use_awex', False)
+
+        # IMPORTANT: In AWEX mode, skip reload_process_groups() to avoid deadlock
+        # Problem 7: reload_process_groups() calls new_group() which is collective,
+        #            but different ranks may have inconsistent group states, causing deadlock.
+        # AWEX doesn't need Megatron's TP/PP/CP groups - it uses default world group
+        # and creates its own IPC gloo groups.
+        if self.args.offload_train and not use_awex:
             reload_process_groups()
 
-        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
-        )
-        if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
-            dist.barrier(group=get_gloo_group())
+        my_rank = dist.get_rank()
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-            print_memory("before update_weights")
-            self.weight_updater.update_weights()
-            print_memory("after update_weights")
+        if use_awex:
+            # ============================================================
+            # AWEX mode: Rank 0 gets engines + Gloo broadcast (same as baseline)
+            # ============================================================
+            # Problem 8: 16 leaders calling ray.get() concurrently causes queueing
+            #            because RolloutManager is single-threaded Ray Actor.
+            #            Only Rank 0 completes quickly, others get stuck.
+            #
+            # Solution: Follow Slime baseline pattern:
+            #           1. Only Rank 0 calls ray.get()
+            #           2. Gloo broadcast engines to all 128 ranks
+            #           3. Each rank extracts its engine based on engine_idx
+            #           4. Leaders connect, non-leaders set_awex_leader
+            #           5. NCCL barrier before AWEX
+            # ============================================================
 
-            if self.args.ci_test and len(rollout_engines) > 0:
-                engine = random.choice(rollout_engines)
-                engine_version = ray.get(engine.get_weight_version.remote())
-                if str(engine_version) != str(self.weight_updater.weight_version):
-                    raise RuntimeError(
-                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+            awex_group_size = getattr(self.args, 'actor_num_gpus_per_node', 8)
+            world_size = dist.get_world_size()
+            num_engines = world_size // awex_group_size
+            engine_idx = my_rank // awex_group_size
+            engine_first_rank = engine_idx * awex_group_size
+            is_engine_leader = (my_rank == engine_first_rank)
+
+            logger.info(
+                f"[AWEX] Rank {my_rank}: engine_idx={engine_idx}, "
+                f"leader_rank={engine_first_rank}, is_leader={is_engine_leader}"
+            )
+
+            # Step 1: Only Rank 0 calls Ray (avoid 16-way queueing)
+            import time as _time
+            if my_rank == 0:
+                _ray_start = _time.time()
+                all_engines, rollout_engine_lock, num_new_engines = ray.get(
+                    self.rollout_manager.get_rollout_engines_and_lock.remote(return_all_engines=True)
+                )
+                _ray_elapsed = (_time.time() - _ray_start) * 1000  # ms
+                logger.info(
+                    f"[AWEX] Rank 0 got {len(all_engines)} engines from Ray in {_ray_elapsed:.1f}ms "
+                    f"(num_new={num_new_engines})"
+                )
+                result_to_broadcast = [all_engines, rollout_engine_lock, num_new_engines]
+            else:
+                result_to_broadcast = [None, None, None]
+
+            # Step 2: Gloo broadcast engines to all 128 ranks (same as baseline)
+            logger.debug(f"[AWEX] Rank {my_rank} entering Gloo broadcast")
+            dist.broadcast_object_list(result_to_broadcast, src=0, group=get_gloo_group())
+            all_engines, rollout_engine_lock, num_new_engines = result_to_broadcast
+            logger.debug(f"[AWEX] Rank {my_rank} received {len(all_engines)} engines via Gloo broadcast")
+
+            # Step 3: Each rank connects to its engine
+            if is_engine_leader:
+                if engine_idx < len(all_engines):
+                    my_engine = all_engines[engine_idx]
+                    self.weight_updater.connect_awex_engine(
+                        my_engine, engine_first_rank, all_engines
                     )
-
-            if getattr(self.args, "keep_old_actor", False):
-                if self.args.update_weights_interval == 1:
-                    logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
-                    # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
-                    # First copy rollout_actor to old_actor
-                    self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    # Then copy current actor to rollout_actor
-                    self.weights_backuper.backup("rollout_actor")
+                    logger.info(f"[AWEX] Leader rank {my_rank} connected to engine {engine_idx}")
                 else:
-                    self.weights_backuper.backup("old_actor")
+                    logger.warning(
+                        f"[AWEX] Leader rank {my_rank}: engine_idx={engine_idx} >= "
+                        f"num_engines={len(all_engines)}, using set_awex_leader"
+                    )
+                    self.weight_updater.set_awex_leader(engine_first_rank)
+            else:
+                # Non-leaders: Just set leader rank
+                self.weight_updater.set_awex_leader(engine_first_rank)
+                logger.debug(f"[AWEX] Non-leader rank {my_rank} set leader to {engine_first_rank}")
+
+            logger.info(f"[AWEX] Rank {my_rank} entering update_weights context (leader={is_engine_leader})")
+
+            # Put barrier INSIDE torch_memory_saver context to avoid CUDA errors
+            with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+                # Barrier ensures all ranks are synced before entering AWEX
+                # (Gloo broadcast already syncs, but NCCL barrier is safer for AWEX internals)
+                # Problem 6: Barrier outside context causes CUDA errors in offload mode
+                logger.debug(f"[AWEX] Rank {my_rank} at pre-AWEX barrier (inside context)")
+                dist.barrier()  # Uses default NCCL group, inside proper context
+                logger.debug(f"[AWEX] Rank {my_rank} passed pre-AWEX barrier")
+
+                print_memory("before update_weights")
+                self.weight_updater.update_weights()
+                print_memory("after update_weights")
+
+        else:
+            # ============================================================
+            # Baseline mode: Original Slime flow (all ranks call ray.get)
+            # ============================================================
+            # Note: All 128 ranks call ray.get() - this is fast because
+            # get_rollout_engines_and_lock() just returns cached attributes.
+            # The RolloutManager queues requests but each takes microseconds.
+            rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+                self.rollout_manager.get_rollout_engines_and_lock.remote()
+            )
+            if num_new_engines > 0:
+                self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+                dist.barrier(group=get_gloo_group())
+
+            with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+                print_memory("before update_weights")
+                self.weight_updater.update_weights()
+                print_memory("after update_weights")
+
+                if self.args.ci_test and len(rollout_engines) > 0:
+                    engine = random.choice(rollout_engines)
+                    engine_version = ray.get(engine.get_weight_version.remote())
+                    if str(engine_version) != str(self.weight_updater.weight_version):
+                        raise RuntimeError(
+                            f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                        )
+
+                if getattr(self.args, "keep_old_actor", False):
+                    if self.args.update_weights_interval == 1:
+                        logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+                        self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+                        self.weights_backuper.backup("rollout_actor")
+                    else:
+                        self.weights_backuper.backup("old_actor")
 
         if self.args.offload_train:
             destroy_process_groups()

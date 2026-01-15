@@ -286,6 +286,43 @@ class SGLangEngine(RayActor):
             },
         )
 
+    def update_weights_from_awex(self, awex_req):
+        """
+        AWEX Colocate Mode: Trigger SGLang to receive weights via AWEX.
+
+        This method is called by training side via Ray to signal SGLang
+        to start receiving weights. The actual transfer happens through
+        MetaServer + NCCL P2P.
+
+        Args:
+            awex_req: UpdateWeightsFromAwexReqInput with step_id, weight_version, flush_cache
+
+        Returns:
+            UpdateWeightsFromAwexReqOutput with success status
+        """
+        if self.node_rank != 0:
+            # Non-rank-0 nodes don't make HTTP requests
+            from sglang.srt.managers.io_struct import UpdateWeightsFromAwexReqOutput
+            return UpdateWeightsFromAwexReqOutput(success=True, message="Skipped for non-rank-0")
+
+        # Convert pydantic model to dict for HTTP request
+        payload = {
+            "step_id": awex_req.step_id,
+            "weight_version": awex_req.weight_version if hasattr(awex_req, 'weight_version') else str(awex_req.step_id),
+            "flush_cache": awex_req.flush_cache if hasattr(awex_req, 'flush_cache') else False,
+        }
+
+        try:
+            result = self._make_request("update_weights_from_metaserver", payload)
+            from sglang.srt.managers.io_struct import UpdateWeightsFromAwexReqOutput
+            return UpdateWeightsFromAwexReqOutput(
+                success=result.get("success", False),
+                message=result.get("message", "")
+            )
+        except Exception as e:
+            from sglang.srt.managers.io_struct import UpdateWeightsFromAwexReqOutput
+            return UpdateWeightsFromAwexReqOutput(success=False, message=str(e))
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -478,6 +515,17 @@ def _compute_server_args(
         num_engines = args.rollout_num_gpus // num_gpu_per_engine
         kwargs["num_engines"] = num_engines
         kwargs["engine_rank"] = rank  # rank is passed to _compute_server_args
+
+        # In cross-node colocate mode, each engine independently handles weight updates
+        # for its 8 GPUs. This is needed because execute_task_in_model_worker only
+        # works within a single scheduler and cannot broadcast across nodes.
+        is_cross_node = nnodes > 1  # True if SGLang server spans multiple nodes
+        if is_cross_node and kwargs.get("enable_colocate_mode", False):
+            kwargs["awex_per_node_mode"] = True
+            logger.info(
+                f"[AWEX] Engine rank={rank}: Enabling per-node mode for cross-node colocate "
+                f"(nnodes={nnodes}, node_rank={node_rank})"
+            )
 
     # MetaServer P2P: pass parameters to SGLang
     if getattr(args, "use_metaserver_p2p", False):

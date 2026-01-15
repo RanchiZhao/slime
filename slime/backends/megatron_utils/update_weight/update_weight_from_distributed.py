@@ -2,6 +2,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import ray
 import torch
@@ -31,9 +32,13 @@ class UpdateWeightFromDistributed:
         *,
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
+        hf_config: Any = None,
     ) -> None:
         """
         Initialize. Groups created in connect_rollout_engines.
+
+        Args:
+            hf_config: Unused, accepted for API compatibility with UpdateWeightFromTensor.
         """
         self.args = args
         self.model = model
