@@ -498,12 +498,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         use_awex = getattr(self.args, 'use_awex', False)
 
-        # IMPORTANT: In AWEX mode, skip reload_process_groups() to avoid deadlock
-        # Problem 7: reload_process_groups() calls new_group() which is collective,
-        #            but different ranks may have inconsistent group states, causing deadlock.
-        # AWEX doesn't need Megatron's TP/PP/CP groups - it uses default world group
-        # and creates its own IPC gloo groups.
-        if self.args.offload_train and not use_awex:
+        # Reload process groups for both baseline and AWEX modes.
+        # AWEX's get_mcore_rank_info() needs Megatron's TP/PP/CP groups to get rank info.
+        # Previous comment was incorrect - AWEX does need these groups.
+        if self.args.offload_train:
             reload_process_groups()
 
         my_rank = dist.get_rank()
@@ -522,6 +520,7 @@ class MegatronTrainRayActor(TrainRayActor):
             #           3. Each rank extracts its engine based on engine_idx
             #           4. Leaders connect, non-leaders set_awex_leader
             #           5. NCCL barrier before AWEX
+            # 这个方案看起来也不太行，现在这个barrier看起来卡住了。
             # ============================================================
 
             awex_group_size = getattr(self.args, 'actor_num_gpus_per_node', 8)
@@ -536,60 +535,110 @@ class MegatronTrainRayActor(TrainRayActor):
                 f"leader_rank={engine_first_rank}, is_leader={is_engine_leader}"
             )
 
-            # Step 1: Only Rank 0 calls Ray (avoid 16-way queueing)
+            # Step 1: Each leader independently gets engines via Ray
+            # NOTE: We skip Gloo broadcast because Gloo groups can be misconfigured
+            # (some ranks may have 0 peers, causing broadcast to hang).
+            # Instead, each of 16 leaders calls Ray independently - acceptable overhead.
+            # 
+            # CRITICAL: All leaders must complete Ray calls BEFORE any rank enters the context,
+            # because non-leaders will immediately enter the context and reach barrier.
+            # If leaders are still in Ray.get(), they won't reach barrier, causing deadlock.
             import time as _time
-            if my_rank == 0:
+            all_engines = None
+            rollout_engine_lock = None
+            if is_engine_leader:
                 _ray_start = _time.time()
                 all_engines, rollout_engine_lock, num_new_engines = ray.get(
                     self.rollout_manager.get_rollout_engines_and_lock.remote(return_all_engines=True)
                 )
                 _ray_elapsed = (_time.time() - _ray_start) * 1000  # ms
                 logger.info(
-                    f"[AWEX] Rank 0 got {len(all_engines)} engines from Ray in {_ray_elapsed:.1f}ms "
-                    f"(num_new={num_new_engines})"
+                    f"[AWEX] Leader rank {my_rank} got {len(all_engines)} engines from Ray in {_ray_elapsed:.1f}ms "
+                    f"(engine_idx={engine_idx})"
                 )
-                result_to_broadcast = [all_engines, rollout_engine_lock, num_new_engines]
-            else:
-                result_to_broadcast = [None, None, None]
 
-            # Step 2: Gloo broadcast engines to all 128 ranks (same as baseline)
-            logger.debug(f"[AWEX] Rank {my_rank} entering Gloo broadcast")
-            dist.broadcast_object_list(result_to_broadcast, src=0, group=get_gloo_group())
-            all_engines, rollout_engine_lock, num_new_engines = result_to_broadcast
-            logger.debug(f"[AWEX] Rank {my_rank} received {len(all_engines)} engines via Gloo broadcast")
-
-            # Step 3: Each rank connects to its engine
+            # Step 1.5: Synchronize using MetaServer to ensure ALL leaders have completed Ray calls
+            # This must be outside context because:
+            # 1. Leaders are still in Ray.get() (CPU operation, no GPU needed)
+            # 2. Non-leaders will immediately reach this point
+            # 3. Once all leaders complete Ray calls, they put completion signal to MetaServer
+            # 4. Non-leaders wait for all leaders' completion signals via MetaServer
+            # 5. Only after all leaders complete, all ranks enter the context together
+            # 
+            # CRITICAL: Use MetaServer instead of Gloo barrier because:
+            # - Gloo barrier requires all 128 ranks, but 15 leaders are still in Ray.get() queue
+            # - This causes deadlock: non-leaders wait at barrier, leaders can't reach barrier
+            # - MetaServer synchronization doesn't require all ranks to be at the same point
+            from slime.backends.megatron_utils.update_weight.awex_integration import get_awex_meta_server_addr
+            from awex.meta.meta_server import MetaServerClient
+            
+            meta_server_addr = get_awex_meta_server_addr()
+            if meta_server_addr is None:
+                raise ValueError("AWEX_META_SERVER_ADDR environment variable is not set")
+            
+            meta_client = MetaServerClient(*meta_server_addr.split(":"))
+            
             if is_engine_leader:
-                if engine_idx < len(all_engines):
-                    my_engine = all_engines[engine_idx]
-                    self.weight_updater.connect_awex_engine(
-                        my_engine, engine_first_rank, all_engines
-                    )
-                    logger.info(f"[AWEX] Leader rank {my_rank} connected to engine {engine_idx}")
-                else:
-                    logger.warning(
-                        f"[AWEX] Leader rank {my_rank}: engine_idx={engine_idx} >= "
-                        f"num_engines={len(all_engines)}, using set_awex_leader"
-                    )
-                    self.weight_updater.set_awex_leader(engine_first_rank)
-            else:
-                # Non-leaders: Just set leader rank
-                self.weight_updater.set_awex_leader(engine_first_rank)
-                logger.debug(f"[AWEX] Non-leader rank {my_rank} set leader to {engine_first_rank}")
+                # Leader: put completion signal after Ray call
+                completion_key = f"leader_{engine_idx}_ray_done"
+                meta_client.put_object(completion_key, True)
+                logger.info(f"[AWEX] Leader rank {my_rank} (engine_idx={engine_idx}) completed Ray call, put signal to MetaServer")
+            
+            # All ranks: wait for all leaders to complete
+            logger.info(f"[AWEX] Rank {my_rank} waiting for all {num_engines} leaders to complete Ray calls via MetaServer...")
+            for i in range(num_engines):
+                leader_key = f"leader_{i}_ray_done"
+                try:
+                    meta_client.get_object(leader_key, timeout=60)
+                    logger.info(f"[AWEX] Rank {my_rank} confirmed leader {i} completed Ray call")
+                except Exception as e:
+                    logger.error(f"[AWEX] Rank {my_rank} failed to get leader {i} completion signal: {e}")
+                    raise
+            
+            logger.info(f"[AWEX] Rank {my_rank} all {num_engines} leaders completed Ray calls, entering context")
 
-            logger.info(f"[AWEX] Rank {my_rank} entering update_weights context (leader={is_engine_leader})")
-
-            # Put barrier INSIDE torch_memory_saver context to avoid CUDA errors
+            # Step 2-4: All synchronization and setup inside context to avoid CUDA errors
+            # Put ALL barriers INSIDE torch_memory_saver context to avoid CUDA errors
+            # Problem 6: Barrier outside context causes CUDA errors in offload mode
             with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-                # Barrier ensures all ranks are synced before entering AWEX
-                # (Gloo broadcast already syncs, but NCCL barrier is safer for AWEX internals)
-                # Problem 6: Barrier outside context causes CUDA errors in offload mode
-                logger.debug(f"[AWEX] Rank {my_rank} at pre-AWEX barrier (inside context)")
-                dist.barrier()  # Uses default NCCL group, inside proper context
-                logger.debug(f"[AWEX] Rank {my_rank} passed pre-AWEX barrier")
+                # Step 2: Barrier inside context to ensure GPU state is stable
+                # This is a safety barrier after entering context
+                logger.info(f"[AWEX] Rank {my_rank} at post-Ray-call barrier (inside context)")
+                dist.barrier()  # Ensure all ranks are in context with stable GPU state
+                logger.info(f"[AWEX] Rank {my_rank} passed post-Ray-call barrier") # 这里改成info
 
+                # Step 3: Each rank connects to its engine or sets leader
+                if is_engine_leader:
+                    # Leader: connect to the engine it retrieved
+                    if all_engines is not None and engine_idx < len(all_engines):
+                        my_engine = all_engines[engine_idx]
+                        self.weight_updater.connect_awex_engine(
+                            my_engine, engine_first_rank, all_engines
+                        )
+                        logger.info(f"[AWEX] Leader rank {my_rank} connected to engine {engine_idx}")
+                    else:
+                        logger.warning(
+                            f"[AWEX] Leader rank {my_rank}: engine_idx={engine_idx} but all_engines={all_engines}, "
+                            f"falling back to set_awex_leader"
+                        )
+                        self.weight_updater.set_awex_leader(engine_first_rank)
+                else:
+                    # Non-leaders: Just set leader rank (don't need engine info)
+                    self.weight_updater.set_awex_leader(engine_first_rank)
+                    logger.info(f"[AWEX] Non-leader rank {my_rank} set leader to {engine_first_rank}")
+
+                logger.info(f"[AWEX] Rank {my_rank} entering update_weights (leader={is_engine_leader})")
+
+                # Step 4: Final barrier before entering AWEX
+                # Barrier ensures all ranks are synced before entering AWEX
+                logger.info(f"[AWEX] Rank {my_rank} at pre-AWEX barrier (inside context)")
+                dist.barrier()  # Uses default NCCL group, inside proper context
+                logger.info(f"[AWEX] Rank {my_rank} passed pre-AWEX barrier")
+
+                # Step 5: Execute weight update (all ranks together)
                 print_memory("before update_weights")
                 self.weight_updater.update_weights()
+                logger.info(f"[AWEX] Rank {my_rank} update_weights done")
                 print_memory("after update_weights")
 
         else:

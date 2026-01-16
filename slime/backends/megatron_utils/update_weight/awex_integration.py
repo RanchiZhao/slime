@@ -229,17 +229,24 @@ class AwexWeightSender:
 
         This replaces the baseline chunk loop with a single awex call.
         """
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.info(f"[AwexWeightSender] Rank {rank} entering update_weights()")
+        
+        logger.info(f"[AwexWeightSender] Rank {rank} calling initialize()")
         self.initialize()
+        logger.info(f"[AwexWeightSender] Rank {rank} initialize() completed")
 
         self._weight_version += 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        logger.info(f"[AwexWeightSender] Rank {rank} incremented weight_version to {self._weight_version}")
 
         if rank == 0:
             logger.info(
                 f"[AwexWeightSender] Sending weights version {self._weight_version}..."
             )
 
+        logger.info(f"[AwexWeightSender] Rank {rank} about to call _writer.write_weights(step_id={self._weight_version})")
         self._writer.write_weights(step_id=self._weight_version)
+        logger.info(f"[AwexWeightSender] Rank {rank} returned from _writer.write_weights()")
 
         if rank == 0:
             logger.info(
@@ -247,6 +254,7 @@ class AwexWeightSender:
             )
 
         assert self._weight_version > 0, "Post-condition failed: weight_version > 0"
+        logger.info(f"[AwexWeightSender] Rank {rank} update_weights() completed")
 
 
 def is_awex_enabled(args: Namespace) -> bool:

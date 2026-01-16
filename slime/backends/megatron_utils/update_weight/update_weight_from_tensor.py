@@ -240,7 +240,7 @@ class UpdateWeightFromTensor:
         """
         self._awex_engine_first_rank = engine_first_rank
         self.use_distribute = False
-        logger.debug(
+        logger.info(
             f"[AWEX] Rank {dist.get_rank()} set leader to {engine_first_rank}"
         )
 
@@ -272,6 +272,7 @@ class UpdateWeightFromTensor:
         # AWEX mode: use optimized weight sync
         if self._use_awex:
             _log_mem(f"AWEX update_weights START version={self.weight_version}")
+            logger.info(f"[AWEX] Rank {rank} entering update_weights() method (version={self.weight_version})")
             if rank == 0:
                 logger.info(f"[AWEX] Starting weight update version {self.weight_version}")
 
@@ -281,6 +282,7 @@ class UpdateWeightFromTensor:
             # e.g., rank 0 triggers engine 0, rank 64 triggers engine 1
             awex_refs = []
             should_trigger = hasattr(self, '_awex_engine_first_rank') and rank == self._awex_engine_first_rank
+            logger.info(f"[AWEX] Rank {rank} checking trigger: has _awex_engine_first_rank={hasattr(self, '_awex_engine_first_rank')}, rank={rank}, _awex_engine_first_rank={getattr(self, '_awex_engine_first_rank', 'N/A')}, should_trigger={should_trigger}")
             if should_trigger:
                 from sglang.srt.managers.io_struct import UpdateWeightsFromAwexReqInput
                 awex_req = UpdateWeightsFromAwexReqInput(
@@ -288,16 +290,20 @@ class UpdateWeightFromTensor:
                     weight_version=str(self.weight_version),
                     flush_cache=True,
                 )
+                logger.info(f"[AWEX] Rank {rank} creating Ray call for engine (step_id={self.weight_version})")
                 awex_refs.append(self._ipc_engine.update_weights_from_awex.remote(awex_req))
                 logger.info(f"[AWEX] Rank {rank} triggered SGLang engine for step {self.weight_version} (engine leader)")
             else:
                 engine_leader = getattr(self, '_awex_engine_first_rank', 'unknown')
-                logger.debug(f"[AWEX] Rank {rank} skipping trigger (engine leader is {engine_leader})")
+                logger.info(f"[AWEX] Rank {rank} skipping trigger (engine leader is {engine_leader})")
 
             # Step 2: Training side writes weights to MetaServer
             # This will block until SGLang finishes receiving
+            logger.info(f"[AWEX] Rank {rank} about to call _awex_sender.update_weights()")
             _log_mem(f"AWEX BEFORE _awex_sender.update_weights() version={self.weight_version}")
+            # 卡在这里 后面没信息了
             self._awex_sender.update_weights()
+            logger.info(f"[AWEX] Rank {rank} returned from _awex_sender.update_weights()")
             _log_mem(f"AWEX AFTER _awex_sender.update_weights() version={self.weight_version}")
 
             # Step 3: Wait for Ray call to complete (should be done by now)
