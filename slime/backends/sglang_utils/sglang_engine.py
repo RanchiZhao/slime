@@ -510,21 +510,43 @@ def _compute_server_args(
         kwargs["enable_awex"] = True
         kwargs["meta_server_addr"] = getattr(args, "awex_meta_server_addr", None)
         kwargs["enable_colocate_mode"] = getattr(args, "awex_colocate_mode", True)
-        # Calculate num_engines and engine_rank for awex coordination
-        num_gpu_per_engine = min(args.rollout_num_gpus_per_engine, args.num_gpus_per_node)
-        num_engines = args.rollout_num_gpus // num_gpu_per_engine
-        kwargs["num_engines"] = num_engines
-        kwargs["engine_rank"] = rank  # rank is passed to _compute_server_args
 
-        # In cross-node colocate mode, each engine independently handles weight updates
-        # for its 8 GPUs. This is needed because execute_task_in_model_worker only
-        # works within a single scheduler and cannot broadcast across nodes.
-        is_cross_node = nnodes > 1  # True if SGLang server spans multiple nodes
-        if is_cross_node and kwargs.get("enable_colocate_mode", False):
+        # Calculate LOGICAL engine count for AWEX coordination
+        # Important: When rollout_num_gpus_per_engine=64 and num_gpus_per_node=8,
+        # we have 8 Ray Actors forming ONE logical SGLang Engine (via shared dist_init_addr).
+        # AWEX should see num_engines=1, not num_engines=8.
+        nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
+        num_logical_engines = args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        kwargs["num_engines"] = num_logical_engines
+        kwargs["engine_rank"] = rank // nodes_per_engine
+
+        logger.info(
+            f"[AWEX] Ray Actor rank={rank}: logical num_engines={num_logical_engines}, "
+            f"engine_rank={rank // nodes_per_engine}, nodes_per_engine={nodes_per_engine}"
+        )
+
+        # Per-node mode handling:
+        # When multiple Ray Actors form ONE logical SGLang Engine (nodes_per_engine > 1),
+        # all workers share the same torch.distributed group and NCCL communicator.
+        # In this case, only node_rank=0's Scheduler handles requests, and can broadcast
+        # to all workers across all nodes. So per-node mode is NOT needed.
+        #
+        # When each Ray Actor is a separate logical Engine (nodes_per_engine == 1),
+        # each has its own Scheduler and cannot broadcast across nodes, so per-node
+        # mode might be needed for colocate weight updates.
+        is_cross_node = nnodes > 1
+        is_multi_node_single_engine = nodes_per_engine > 1  # Multiple Ray Actors = 1 logical Engine
+        if is_cross_node and kwargs.get("enable_colocate_mode", False) and not is_multi_node_single_engine:
+            # Only enable per-node mode when we have multiple separate engines
             kwargs["awex_per_node_mode"] = True
             logger.info(
                 f"[AWEX] Engine rank={rank}: Enabling per-node mode for cross-node colocate "
                 f"(nnodes={nnodes}, node_rank={node_rank})"
+            )
+        elif is_multi_node_single_engine:
+            logger.info(
+                f"[AWEX] Engine rank={rank}: Single Engine mode with {nodes_per_engine} nodes, "
+                f"per-node mode NOT needed (all 64 workers in same NCCL group)"
             )
 
     # MetaServer P2P: pass parameters to SGLang
