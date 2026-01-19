@@ -1,6 +1,8 @@
 import dataclasses
 import logging
 import multiprocessing
+import os
+import socket
 import time
 
 import requests
@@ -14,6 +16,19 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+
+def _get_free_port():
+    """Get a free port on the current machine."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+def _get_ip_address():
+    """Get the IP address of the current machine."""
+    hostname = socket.gethostname()
+    return socket.gethostbyname(hostname)
 
 
 def get_base_gpu_id(args, rank):
@@ -406,6 +421,164 @@ class SGLangEngine(RayActor):
         except requests.exceptions.RequestException:
             # catch the case there the engine is just created and does not have the group.
             pass
+
+    def init_awex_colocate_group(
+        self,
+        meta_server_addr: str,
+        infer_world_size: int,
+        num_ray_actors: int,
+        actor_index: int,
+        group_name: str = "awex_colocate",
+        timeout: float = 300.0,
+        engine_id: int = 0,
+        actor_index_within_engine: int = 0,
+    ):
+        """
+        Pre-initialize AWEX colocate NCCL group during SGLang startup.
+
+        This method coordinates all Ray Actors (via MetaServer) to simultaneously
+        call init_weights_update_group, ensuring the TCP rendezvous succeeds.
+
+        Plan A核心：在SGLang启动时（所有worker同步状态）预先创建NCCL group，
+        而不是在第一次update_weights时创建（那时8个Ray Actor触发时间有差异）。
+
+        CRITICAL: In multi-engine mode (e.g., 2 engines × 64 GPUs = 128 total),
+        we create ONE global NCCL group containing ALL 128 workers, not separate
+        groups per engine. This enables cross-engine P2P communication.
+
+        Args:
+            meta_server_addr: MetaServer address (ip:port)
+            infer_world_size: Total number of inference workers (e.g., 128 for global group)
+            num_ray_actors: Total number of Ray Actors (e.g., 16 for global group)
+            actor_index: Global index of this Ray Actor (0 to num_ray_actors-1)
+            group_name: Name for the NCCL group (default: "awex_colocate")
+            timeout: Timeout for coordination (default: 300s)
+            engine_id: Logical engine ID (0 or 1 for 2-engine setup)
+            actor_index_within_engine: Actor index within its logical engine (0-7)
+
+        Returns:
+            Result from init_weights_update_group if successful
+        """
+        from awex.meta.meta_server import MetaServerClient
+
+        # Parse meta_server_addr (format: "ip:port")
+        if ":" in meta_server_addr:
+            addr_parts = meta_server_addr.rsplit(":", 1)
+            meta_host = addr_parts[0]
+            meta_port = int(addr_parts[1])
+        else:
+            raise ValueError(f"Invalid meta_server_addr format: {meta_server_addr}, expected 'ip:port'")
+
+        meta_client = MetaServerClient(meta_host, meta_port)
+        logger.info(
+            f"[AWEX_COLOCATE_INIT] Actor {actor_index} node_rank={self.node_rank}: Starting pre-initialization "
+            f"(infer_world_size={infer_world_size}, num_actors={num_ray_actors})"
+        )
+
+        # Step 1: Coordinate master_address and master_port
+        master_info_key = f"awex_colocate_master_info_{group_name}"
+        if actor_index == 0:
+            # Actor 0 sets the master info
+            master_address = _get_ip_address()
+            master_port = _get_free_port()
+            meta_client.put_object(master_info_key, (master_address, master_port))
+            logger.info(
+                f"[AWEX_COLOCATE_INIT] Actor 0: Set master_info = ({master_address}, {master_port})"
+            )
+        else:
+            # Other actors get the master info
+            master_address, master_port = meta_client.get_object(master_info_key, timeout=timeout)
+            logger.info(
+                f"[AWEX_COLOCATE_INIT] Actor {actor_index}: Got master_info = ({master_address}, {master_port})"
+            )
+
+        # Step 2: Signal that this actor is ready
+        ready_key = f"awex_colocate_ready_{group_name}"
+        meta_client.add_object_to_set(ready_key, actor_index)
+        logger.info(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: Signaled ready")
+
+        # Step 3: Wait for all actors to be ready
+        logger.info(
+            f"[AWEX_COLOCATE_INIT] Actor {actor_index}: Waiting for all {num_ray_actors} actors to be ready..."
+        )
+        meta_client.wait_set_until_size(ready_key, num_ray_actors, timeout=timeout)
+        logger.info(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: All actors ready!")
+
+        # Step 4: Call init_weights_update_group
+        # ARCHITECTURE: In SGLang multi-node setup, multiple Ray Actors form ONE SGLang server:
+        #   - Only node_rank=0 has HTTP server
+        #   - node_rank>0 have NO HTTP server, only workers
+        #   - When node_rank=0 sends HTTP request, it broadcasts to workers in this engine
+        #
+        # For GLOBAL group (multi-engine):
+        #   - Each engine's node_rank=0 sends HTTP request with different rank_offset
+        #   - Engine 0: rank_offset=0, workers get rank 0-63
+        #   - Engine 1: rank_offset=64, workers get rank 64-127
+        #
+        # All requests must happen simultaneously so all 128 workers participate in NCCL init.
+
+        workers_per_actor = infer_world_size // num_ray_actors  # 8 workers per actor
+        # For global group: rank_offset based on global actor_index
+        rank_offset = actor_index * workers_per_actor
+
+        logger.info(
+            f"[AWEX_COLOCATE_INIT] Actor {actor_index} (engine={engine_id}, within_engine={actor_index_within_engine}) "
+            f"node_rank={self.node_rank}: rank_offset={rank_offset}, world_size={infer_world_size}"
+        )
+
+        # Step 4a: node_rank=0 of each engine sends HTTP request
+        # Use engine-specific completion key so each engine's workers wait for their own node_rank=0
+        group_created_key = f"awex_colocate_group_created_{group_name}_engine_{engine_id}"
+        if self.node_rank == 0:
+            # node_rank=0 has HTTP server, send request
+            # CRITICAL: rank_offset must be calculated for this engine's position in the global group
+            url = f"http://{self.server_host}:{self.server_port}/init_weights_update_group"
+            payload = {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": rank_offset,  # Global offset for this engine
+                "world_size": infer_world_size,
+                "group_name": group_name,
+                "backend": "nccl",
+            }
+
+            logger.info(
+                f"[AWEX_COLOCATE_INIT] Actor {actor_index} (engine {engine_id}): "
+                f"Sending HTTP POST to {url} with rank_offset={rank_offset}"
+            )
+
+            try:
+                response = requests.post(url, json=payload, timeout=timeout)
+                response.raise_for_status()
+                result = response.json()
+            except requests.exceptions.RequestException as e:
+                logger.error(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: HTTP request failed: {e}")
+                raise
+
+            logger.info(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: init_weights_update_group result = {result}")
+
+            # Signal completion to other actors in this engine
+            meta_client.put_object(group_created_key, result)
+            logger.info(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: Signaled group creation complete for engine {engine_id}")
+        else:
+            # node_rank != 0: no HTTP server, wait for this engine's node_rank=0 to complete
+            logger.info(
+                f"[AWEX_COLOCATE_INIT] Actor {actor_index}: "
+                f"Waiting for engine {engine_id}'s node_rank=0 to complete HTTP request..."
+            )
+            result = meta_client.get_object(group_created_key, timeout=timeout)
+            logger.info(f"[AWEX_COLOCATE_INIT] Actor {actor_index}: engine {engine_id}'s node_rank=0 completed")
+
+        # Step 5: Cleanup coordination keys (only actor 0)
+        if actor_index == 0:
+            # Wait a bit for all actors to get the result
+            time.sleep(2)
+            meta_client.delete_if_exists(master_info_key)
+            meta_client.delete_if_exists(ready_key)
+            meta_client.delete_if_exists(group_created_key)
+            logger.info(f"[AWEX_COLOCATE_INIT] Actor 0: Cleaned up coordination keys")
+
+        return result
 
     def update_weights_from_distributed(
         self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None

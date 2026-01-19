@@ -413,6 +413,51 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
     ray.get(init_handles)
 
+    # Plan A: Pre-initialize AWEX colocate NCCL group after all engines are ready
+    # This ensures all 64 workers can simultaneously call init_weights_update_group
+    if getattr(args, "use_awex", False) and getattr(args, "awex_colocate_mode", True):
+        meta_server_addr = getattr(args, "awex_meta_server_addr", None)
+        if meta_server_addr:
+            # CRITICAL FIX: Create ONE global NCCL group for ALL inference workers (128)
+            # instead of separate groups per engine (64 each).
+            # This is needed because P2P operations may require cross-engine communication
+            # when training and inference have different parallelism strategies.
+            total_infer_world_size = args.rollout_num_gpus  # Total GPUs: 128
+            total_num_actors = len(rollout_engines)  # Total Ray Actors: 16
+            workers_per_actor = total_infer_world_size // total_num_actors  # 8 workers/actor
+            nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)  # 8
+
+            logger.info(
+                f"[AWEX_COLOCATE_INIT] Creating GLOBAL NCCL group 'awex_colocate_global' "
+                f"for ALL {total_num_actors} Ray Actors (world_size={total_infer_world_size})"
+            )
+
+            # All actors participate in creating one global group
+            # Each actor's rank_offset is calculated based on its global position
+            group_name = "awex_colocate_global"
+            awex_init_handles = []
+            for rank, engine in rollout_engines:
+                # Calculate which logical engine this actor belongs to
+                engine_id = rank // nodes_per_engine
+                actor_index_within_engine = rank % nodes_per_engine
+
+                awex_init_handles.append(
+                    engine.init_awex_colocate_group.remote(
+                        meta_server_addr=meta_server_addr,
+                        infer_world_size=total_infer_world_size,  # 128, not 64
+                        num_ray_actors=total_num_actors,  # 16, not 8
+                        actor_index=rank,  # Global actor index 0-15, not per-engine 0-7
+                        group_name=group_name,
+                        engine_id=engine_id,  # Pass engine_id for rank_offset calculation
+                        actor_index_within_engine=actor_index_within_engine,
+                    )
+                )
+
+            results = ray.get(awex_init_handles)
+            logger.info(f"[AWEX_COLOCATE_INIT] Global group '{group_name}' initialized for {total_num_actors} actors")
+
+            logger.info("[AWEX_COLOCATE_INIT] AWEX global colocate group pre-initialized successfully")
+
     return num_new_engines
 
 
